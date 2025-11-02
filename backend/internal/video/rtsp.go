@@ -12,24 +12,28 @@ import (
 
 // RTSPVideoSource handles RTSP stream using ffmpeg
 type RTSPVideoSource struct {
-	rtspURL     string
-	cmd         *exec.Cmd
-	stdout      io.ReadCloser
-	frameChan   chan []byte
-	errChan     chan error
-	mu          sync.Mutex
-	closed      bool
-	accessUnit  []byte // Accumulator for complete access units
-	spsPpsFound bool   // Track if we've received SPS/PPS
+	rtspURL      string
+	cmd          *exec.Cmd
+	stdout       io.ReadCloser
+	frameChan    chan []byte
+	errChan      chan error
+	mu           sync.Mutex
+	closed       bool
+	accessUnit   []byte // Accumulator for SPS/PPS
+	spsPps       []byte // Persistent copy of SPS/PPS for IDR frames
+	spsPpsFound  bool   // Track if we've received SPS/PPS
+	currentFrame []byte // Accumulator for all NAL units in current access unit
 }
 
 func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
 	return &RTSPVideoSource{
-		rtspURL:     rtspURL,
-		frameChan:   make(chan []byte, 30),
-		errChan:     make(chan error, 1),
-		accessUnit:  make([]byte, 0, 512*1024),
-		spsPpsFound: false,
+		rtspURL:      rtspURL,
+		frameChan:    make(chan []byte, 3), // Small buffer to minimize latency, use smart dropping
+		errChan:      make(chan error, 1),
+		accessUnit:   make([]byte, 0, 256*1024), // Reduced from 512KB
+		spsPps:       make([]byte, 0, 1024),
+		spsPpsFound:  false,
+		currentFrame: make([]byte, 0, 128*1024), // Reduced from 256KB
 	}, nil
 }
 
@@ -51,8 +55,8 @@ func (r *RTSPVideoSource) Start() error {
 		"-fflags", "nobuffer+flush_packets", // Reduce latency and flush immediately
 		"-flags", "low_delay",
 		"-strict", "experimental",
-		"-analyzeduration", "1000000", // Reduce analysis time (1 second)
-		"-probesize", "1000000", // Reduce probe size
+		"-analyzeduration", "500000", // Reduce analysis time (0.5 second) - faster startup
+		"-probesize", "500000", // Reduce probe size - faster startup
 		"-i", r.rtspURL,
 		// Transcode to H.264 (works for both H.264 and HEVC input)
 		// Use hardware acceleration if available (videotoolbox on macOS)
@@ -62,11 +66,16 @@ func (r *RTSPVideoSource) Start() error {
 		"-profile:v", "baseline", // Baseline profile for maximum compatibility
 		"-level", "3.1", // Level 3.1 for good compatibility
 		"-pix_fmt", "yuv420p", // Pixel format for compatibility
+		"-color_range", "pc", // Use PC range (full range 0-255) for proper color
+		"-colorspace", "bt709", // BT.709 color space (standard for web)
+		"-color_primaries", "bt709", // BT.709 color primaries
+		"-color_trc", "bt709", // BT.709 transfer characteristics
 		"-bf", "0", // No B-frames (WebRTC requirement)
-		"-g", "30", // GOP size (keyframe every 30 frames, ~1 second at 30fps)
+		"-g", "15", // GOP size (keyframe every 15 frames, ~0.5 second at 30fps) - reduced for faster recovery
 		"-bsf:v", "h264_mp4toannexb", // Convert to Annex-B format (required for raw H264)
 		"-f", "h264", // Raw H264 format
 		"-flush_packets", "1", // Flush packets immediately
+		"-x264-params", "keyint=15:scenecut=0:force-cfr=1:sync-lookahead=0:sliced-threads=1", // Faster encoding, lower latency
 		"-", // Output to stdout
 	}
 
@@ -119,9 +128,9 @@ func (r *RTSPVideoSource) readFrames() {
 	defer close(r.errChan)
 
 	// H264 NAL Unit start codes: 0x00000001 or 0x000001
-	buffer := make([]byte, 0, 512*1024)              // 512KB initial buffer
-	reader := bufio.NewReaderSize(r.stdout, 64*1024) // 64KB read buffer
-	chunk := make([]byte, 32*1024)                   // Read 32KB chunks
+	buffer := make([]byte, 0, 256*1024)              // 256KB initial buffer (reduced for lower latency)
+	reader := bufio.NewReaderSize(r.stdout, 32*1024) // 32KB read buffer (reduced)
+	chunk := make([]byte, 16*1024)                   // Read 16KB chunks (reduced)
 
 	for {
 		r.mu.Lock()
@@ -295,79 +304,129 @@ func (r *RTSPVideoSource) readFrames() {
 							log.Printf("🔍 First NAL unit extracted: type=%d, size=%d bytes", nalTypeByte, len(nalUnit))
 						}
 
-						// Check if this is a picture frame (IDR or P/B)
+						// Check if this is a picture frame (IDR or P/B) or AUD delimiter
 						isPictureFrame := nalTypeByte == 5 || nalTypeByte == 1
+						isAUD := nalTypeByte == 9 // Access Unit Delimiter
 
-						if isPictureFrame {
-							// Picture frame - send complete access unit
-							// For IDR frames (keyframes), ALWAYS include SPS/PPS if available
-							// For P/B frames, include SPS/PPS only on first frame
-							var completeAccessUnit []byte
+						// If we encounter AUD or a new picture frame and have accumulated a previous frame, send it
+						if (isAUD || isPictureFrame) && len(r.currentFrame) > 0 {
+							// Send the previous complete frame
+							var frameToSend []byte
 
-							if nalTypeByte == 5 {
-								// IDR frame (keyframe) - MUST include SPS/PPS
-								if len(r.accessUnit) > 0 {
-									// Prepend SPS/PPS before IDR frame
-									spsPpsLen := len(r.accessUnit)
-									completeAccessUnit = make([]byte, spsPpsLen+len(nalUnit))
-									copy(completeAccessUnit, r.accessUnit)
-									copy(completeAccessUnit[spsPpsLen:], nalUnit)
-									r.accessUnit = r.accessUnit[:0] // Clear accumulator
-									log.Printf("📦 IDR frame with SPS/PPS: %d + %d = %d bytes",
-										spsPpsLen, len(nalUnit), len(completeAccessUnit))
-								} else {
-									// No SPS/PPS available yet, send IDR alone (might work if sent before)
-									completeAccessUnit = nalUnit
-									log.Printf("⚠️ IDR frame without SPS/PPS (may cause decoding issues)")
-								}
-							} else if nalTypeByte == 1 {
-								// P/B frame - include SPS/PPS only if not sent before
-								if !r.spsPpsFound && len(r.accessUnit) > 0 {
-									// First frame, include SPS/PPS
-									completeAccessUnit = make([]byte, len(r.accessUnit)+len(nalUnit))
-									copy(completeAccessUnit, r.accessUnit)
-									copy(completeAccessUnit[len(r.accessUnit):], nalUnit)
-									r.accessUnit = r.accessUnit[:0]
-									r.spsPpsFound = true // Mark as sent
-									log.Printf("📦 First P/B frame with SPS/PPS: %d bytes", len(completeAccessUnit))
-								} else {
-									// Regular P/B frame, send alone
-									completeAccessUnit = nalUnit
+							// Check if previous frame was IDR and needs SPS/PPS
+							prevFrameType := byte(0)
+							if len(r.currentFrame) >= 5 {
+								if r.currentFrame[0] == 0x00 && r.currentFrame[1] == 0x00 && r.currentFrame[2] == 0x00 && r.currentFrame[3] == 0x01 {
+									if len(r.currentFrame) > 4 {
+										prevFrameType = r.currentFrame[4] & 0x1F
+									}
+								} else if r.currentFrame[0] == 0x00 && r.currentFrame[1] == 0x00 && r.currentFrame[2] == 0x01 {
+									if len(r.currentFrame) > 3 {
+										prevFrameType = r.currentFrame[3] & 0x1F
+									}
 								}
 							}
 
-							// Always log first few frames being queued for debugging
-							frameQueueCounter++
+							if prevFrameType == 5 && len(r.spsPps) > 0 {
+								// Prepend SPS/PPS to IDR frame
+								frameToSend = make([]byte, len(r.spsPps)+len(r.currentFrame))
+								copy(frameToSend, r.spsPps)
+								copy(frameToSend[len(r.spsPps):], r.currentFrame)
+							} else {
+								frameToSend = r.currentFrame
+							}
 
+							frameQueueCounter++
+							// Smart frame dropping: drop old frames when buffer is full, keep latest
 							select {
-							case r.frameChan <- completeAccessUnit:
-								// Successfully queued
+							case r.frameChan <- frameToSend:
 								if frameQueueCounter <= 10 {
-									log.Printf("📤 Queued frame #%d to channel: type=%d, size=%d bytes (channel has %d frames)",
-										frameQueueCounter, nalTypeByte, len(completeAccessUnit), len(r.frameChan))
-								} else if frameQueueCounter%30 == 0 {
-									log.Printf("📤 Queued frame #%d: type=%d, size=%d bytes", frameQueueCounter, nalTypeByte, len(completeAccessUnit))
+									log.Printf("📤 Queued complete access unit #%d: %d bytes", frameQueueCounter, len(frameToSend))
 								}
 							default:
-								// Channel full - this means ReadFrame() is not being called fast enough
-								// This could mean: 1) Connection not established yet, 2) Streaming not started
-								if frameQueueCounter%100 == 0 {
-									log.Printf("⚠️ Frame channel full (capacity 30, %d frames queued), dropping frame (type %d, size %d)", len(r.frameChan), nalTypeByte, len(completeAccessUnit))
-									log.Printf("   This suggests frames are being produced faster than consumed")
-									log.Printf("   Check if WebRTC connection is established and streaming has started")
+								// Channel is full - drop the oldest frame and add the new one
+								// This ensures we always show the latest video without stuttering
+								select {
+								case <-r.frameChan: // Remove oldest frame
+									select {
+									case r.frameChan <- frameToSend: // Add new frame
+										droppedCount := frameQueueCounter - 10
+										if droppedCount%50 == 0 {
+											log.Printf("⚡ Dropped old frame (frame #%d), keeping latest - reducing latency", frameQueueCounter)
+										}
+									default:
+										// Shouldn't happen, but log if it does
+										if frameQueueCounter%100 == 0 {
+											log.Printf("⚠️ Unable to replace frame in channel")
+										}
+									}
+								default:
+									// Channel already empty (shouldn't happen)
+									r.frameChan <- frameToSend
 								}
 							}
+
+							// Clear current frame accumulator
+							r.currentFrame = r.currentFrame[:0]
+						}
+
+						if isAUD {
+							// AUD marks end of access unit - frame should have been sent above
+							// Don't add AUD to frame, it's just a delimiter
+						} else if isPictureFrame {
+							// Start accumulating NAL units for this new frame
+							r.currentFrame = append(r.currentFrame, nalUnit...)
 						} else if nalTypeByte == 7 || nalTypeByte == 8 {
 							// SPS/PPS - accumulate for next access unit
 							r.accessUnit = append(r.accessUnit, nalUnit...)
+
+							// Check if we have both SPS and PPS now
+							hasSPS := false
+							hasPPS := false
+							for i := 0; i < len(r.accessUnit)-3; i++ {
+								var nalType byte
+								if r.accessUnit[i] == 0x00 && r.accessUnit[i+1] == 0x00 && r.accessUnit[i+2] == 0x00 && r.accessUnit[i+3] == 0x01 {
+									if i+4 < len(r.accessUnit) {
+										nalType = r.accessUnit[i+4] & 0x1F
+									} else {
+										continue
+									}
+								} else if r.accessUnit[i] == 0x00 && r.accessUnit[i+1] == 0x00 && r.accessUnit[i+2] == 0x01 {
+									if i+3 < len(r.accessUnit) {
+										nalType = r.accessUnit[i+3] & 0x1F
+									} else {
+										continue
+									}
+								} else {
+									continue
+								}
+
+								if nalType == 7 {
+									hasSPS = true
+								} else if nalType == 8 {
+									hasPPS = true
+								}
+							}
+
+							if hasSPS && hasPPS {
+								// Save persistent copy of SPS/PPS
+								r.spsPps = make([]byte, len(r.accessUnit))
+								copy(r.spsPps, r.accessUnit)
+								log.Printf("📋 Saved SPS/PPS: %d bytes", len(r.spsPps))
+							}
+
 							if !r.spsPpsFound {
-								// Don't mark as found until we actually send it with a frame
-								log.Printf("📋 Received %s parameter set (size: %d bytes) - will include with next frame",
+								log.Printf("📋 Received %s parameter set (size: %d bytes)",
 									map[byte]string{7: "SPS", 8: "PPS"}[nalTypeByte], len(nalUnit))
 							}
 						} else {
-							// Other NAL unit types (AUD=9, SEI=6, etc.) - include in access unit
-							r.accessUnit = append(r.accessUnit, nalUnit...)
+							// Other NAL unit types (AUD=9, SEI=6, etc.) - add to current frame if we're building one
+							if len(r.currentFrame) > 0 {
+								r.currentFrame = append(r.currentFrame, nalUnit...)
+							} else {
+								// Not building a frame yet, accumulate in accessUnit
+								r.accessUnit = append(r.accessUnit, nalUnit...)
+							}
 						}
 					}
 
@@ -414,10 +473,10 @@ func (r *RTSPVideoSource) readFrames() {
 				break
 			}
 
-			// Prevent buffer from growing too large
-			if len(buffer) > 2*1024*1024 { // 2MB max
-				// Keep only last 1MB
-				buffer = buffer[len(buffer)-1024*1024:]
+			// Prevent buffer from growing too large - reduced for lower latency
+			if len(buffer) > 1024*1024 { // 1MB max (reduced from 2MB)
+				// Keep only last 512KB (reduced from 1MB)
+				buffer = buffer[len(buffer)-512*1024:]
 			}
 		}
 	}
@@ -462,9 +521,8 @@ var (
 )
 
 func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
-	// Add timeout to avoid blocking forever
-	// Increased timeout since transcoding may take longer
-	timeout := time.After(10 * time.Second)
+	// Reduced timeout for faster recovery and lower latency
+	timeout := time.After(3 * time.Second)
 
 	select {
 	case frame := <-r.frameChan:
@@ -590,13 +648,15 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 		}
 		return nil, fmt.Errorf("error channel closed")
 	case <-timeout:
-		log.Printf("⚠️ Timeout waiting for RTSP frame (waited 10s)")
+		log.Printf("⚠️ Timeout waiting for RTSP frame (waited 3s)")
 		log.Printf("   Frame channel length: %d", len(r.frameChan))
 		log.Printf("   This might mean:")
 		log.Printf("   1) FFmpeg is still transcoding first frame")
 		log.Printf("   2) NAL unit parsing needs more data")
 		log.Printf("   3) Frame channel may be empty")
-		return nil, fmt.Errorf("timeout waiting for frame")
+		log.Printf("   Will retry...")
+		// Retry immediately for continuous streaming
+		return r.ReadFrame()
 	}
 }
 

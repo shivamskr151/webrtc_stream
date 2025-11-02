@@ -580,9 +580,12 @@ func (p *Publisher) StartStreaming() error {
 				lastFrameTime = time.Now() // Reset timer
 			}
 
-			if errorCount%10 == 0 {
+			// For continuous streaming, don't log every error (reduces spam)
+			if errorCount%30 == 0 {
 				log.Printf("❌ Error capturing frame (count: %d): %v", errorCount, err)
+				log.Printf("   Continuing stream - will retry next frame...")
 			}
+			// Don't skip ticker - continue immediately to keep frame rate consistent
 			continue
 		}
 
@@ -607,47 +610,20 @@ func (p *Publisher) StartStreaming() error {
 			log.Printf("   Next step: Frame will be written to WebRTC track")
 		}
 
-		// Write sample to track
+		// Write sample to track (non-blocking, continues on error for smooth streaming)
 		// WriteSample may return errors if connection isn't ready, but we continue anyway
 		writeErr := p.track.WriteSample(sample)
 		if writeErr != nil {
 			errorCount++
-			// Always log first 10 errors to see what's happening
-			if errorCount <= 10 || errorCount%30 == 0 {
+			// Reduced logging for smoother operation - log less frequently
+			if errorCount <= 5 || (errorCount%50 == 0) {
 				log.Printf("❌ Error writing sample (count: %d): %v", errorCount, writeErr)
-				log.Printf("   Sample size: %d bytes, Duration: %v", len(sample.Data), sample.Duration)
 				log.Printf("   Connection state: PC=%s, ICE=%s", connState.String(), iceState.String())
-
-				// Log first few bytes of sample to verify format
-				if errorCount <= 3 && len(sample.Data) >= 8 {
-					bytesToLog := 16
-					if len(sample.Data) < bytesToLog {
-						bytesToLog = len(sample.Data)
-					}
-					firstBytes := make([]byte, bytesToLog)
-					copy(firstBytes, sample.Data[:bytesToLog])
-					log.Printf("   First bytes (hex): %x", firstBytes)
-					// Check for H264 start codes
-					if len(sample.Data) >= 4 {
-						if sample.Data[0] == 0x00 && sample.Data[1] == 0x00 && sample.Data[2] == 0x00 && sample.Data[3] == 0x01 {
-							log.Printf("   ✅ Valid 4-byte H264 start code detected")
-						} else if sample.Data[0] == 0x00 && sample.Data[1] == 0x00 && sample.Data[2] == 0x01 {
-							log.Printf("   ✅ Valid 3-byte H264 start code detected")
-						} else {
-							log.Printf("   ⚠️ H264 start code NOT detected - format issue!")
-						}
-					}
-				}
-
-				// Check if it's a specific type of error
 				if errorCount <= 5 {
 					log.Printf("   ⚠️ Initial errors are normal if connection isn't ready yet")
-				} else if errorCount > 30 {
-					log.Printf("   🚨 Persistent errors after 30 attempts - connection may not be established")
-					log.Printf("   Check: 1) Is viewer connected? 2) Are ICE candidates exchanged? 3) Is connection state 'connected'?")
 				}
 			}
-			// Continue trying - don't skip frames on error
+			// Continue immediately - don't block, keep frame rate consistent
 			// WebRTC will buffer once connection is ready
 			continue
 		}
