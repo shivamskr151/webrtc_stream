@@ -6,8 +6,12 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"webrtc-streaming/internal/config"
 )
 
 // RTSPVideoSource handles RTSP stream using ffmpeg
@@ -23,6 +27,7 @@ type RTSPVideoSource struct {
 	spsPps       []byte // Persistent copy of SPS/PPS for IDR frames
 	spsPpsFound  bool   // Track if we've received SPS/PPS
 	currentFrame []byte // Accumulator for all NAL units in current access unit
+	frameRate    int    // Detected frame rate from stream (FPS)
 }
 
 func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
@@ -33,7 +38,8 @@ func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
 		accessUnit:   make([]byte, 0, 128*1024), // Further reduced for minimal latency
 		spsPps:       make([]byte, 0, 1024),
 		spsPpsFound:  false,
-		currentFrame: make([]byte, 0, 64*1024), // Minimal frame buffer
+		currentFrame: make([]byte, 0, 64*1024),   // Minimal frame buffer
+		frameRate:    config.AppConfig.Video.FPS, // Default to config, will be updated from stream
 	}, nil
 }
 
@@ -100,7 +106,7 @@ func (r *RTSPVideoSource) Start() error {
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	// Log stderr in a goroutine for debugging
+	// Log stderr in a goroutine for debugging and extract frame rate
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
@@ -108,6 +114,25 @@ func (r *RTSPVideoSource) Start() error {
 			// Log important ffmpeg messages
 			if len(line) > 0 {
 				log.Printf("ffmpeg: %s", line)
+
+				// Extract frame rate from ffmpeg output (e.g., "15 fps")
+				if strings.Contains(line, " fps") || strings.Contains(line, " tbr") {
+					// Look for patterns like "15 fps" or "15 tbr"
+					parts := strings.Fields(line)
+					for i, part := range parts {
+						if (part == "fps" || part == "tbr") && i > 0 {
+							if fps, err := strconv.Atoi(strings.TrimSuffix(parts[i-1], ",")); err == nil && fps > 0 {
+								r.mu.Lock()
+								if r.frameRate != fps {
+									log.Printf("📊 Detected frame rate from stream: %d FPS (was configured: %d FPS)", fps, r.frameRate)
+									r.frameRate = fps
+								}
+								r.mu.Unlock()
+								break
+							}
+						}
+					}
+				}
 			}
 		}
 	}()
@@ -313,21 +338,41 @@ func (r *RTSPVideoSource) readFrames() {
 							// Send the previous complete frame
 							var frameToSend []byte
 
-							// Check if previous frame was IDR and needs SPS/PPS
-							prevFrameType := byte(0)
-							if len(r.currentFrame) >= 5 {
-								if r.currentFrame[0] == 0x00 && r.currentFrame[1] == 0x00 && r.currentFrame[2] == 0x00 && r.currentFrame[3] == 0x01 {
-									if len(r.currentFrame) > 4 {
-										prevFrameType = r.currentFrame[4] & 0x1F
+							// Check if current frame contains an IDR (NAL type 5) anywhere
+							hasIDR := false
+							if len(r.spsPps) > 0 {
+								// Scan through currentFrame to find IDR NAL unit
+								i := 0
+								for i < len(r.currentFrame) {
+									var nalStart int
+									var nalType byte
+
+									// Find start code
+									if i+4 <= len(r.currentFrame) && r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x00 && r.currentFrame[i+3] == 0x01 {
+										nalStart = i + 4
+										if nalStart < len(r.currentFrame) {
+											nalType = r.currentFrame[nalStart] & 0x1F
+										}
+										i = nalStart + 1
+									} else if i+3 <= len(r.currentFrame) && r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x01 {
+										nalStart = i + 3
+										if nalStart < len(r.currentFrame) {
+											nalType = r.currentFrame[nalStart] & 0x1F
+										}
+										i = nalStart + 1
+									} else {
+										i++
+										continue
 									}
-								} else if r.currentFrame[0] == 0x00 && r.currentFrame[1] == 0x00 && r.currentFrame[2] == 0x01 {
-									if len(r.currentFrame) > 3 {
-										prevFrameType = r.currentFrame[3] & 0x1F
+
+									if nalType == 5 {
+										hasIDR = true
+										break
 									}
 								}
 							}
 
-							if prevFrameType == 5 && len(r.spsPps) > 0 {
+							if hasIDR {
 								// Prepend SPS/PPS to IDR frame
 								frameToSend = make([]byte, len(r.spsPps)+len(r.currentFrame))
 								copy(frameToSend, r.spsPps)
@@ -687,4 +732,11 @@ func (r *RTSPVideoSource) Close() error {
 	}
 
 	return nil
+}
+
+// GetFrameRate returns the detected frame rate from the stream
+func (r *RTSPVideoSource) GetFrameRate() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.frameRate
 }

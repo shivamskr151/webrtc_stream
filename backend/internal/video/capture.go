@@ -14,6 +14,7 @@ type VideoSource interface {
 	Start() error
 	ReadFrame() ([]byte, error)
 	Close() error
+	GetFrameRate() int // Get the actual frame rate of the source
 }
 
 // MockVideoSource is a placeholder for actual video capture
@@ -71,6 +72,10 @@ func (m *MockVideoSource) Close() error {
 	return nil
 }
 
+func (m *MockVideoSource) GetFrameRate() int {
+	return m.fps
+}
+
 // VideoCapturer handles video capture and encoding
 type VideoCapturer struct {
 	source    VideoSource
@@ -87,9 +92,15 @@ func NewVideoCapturer() (*VideoCapturer, error) {
 		return nil, fmt.Errorf("failed to start video source: %w", err)
 	}
 
+	// Get actual frame rate from source (may differ from config)
+	actualFPS := source.GetFrameRate()
+	if actualFPS <= 0 {
+		actualFPS = config.AppConfig.Video.FPS
+	}
+
 	return &VideoCapturer{
 		source:    source,
-		frameRate: time.Second / time.Duration(config.AppConfig.Video.FPS),
+		frameRate: time.Second / time.Duration(actualFPS),
 	}, nil
 }
 
@@ -107,6 +118,12 @@ func (vc *VideoCapturer) CaptureFrame() (media.Sample, error) {
 		return media.Sample{}, fmt.Errorf("empty frame data received")
 	}
 
+	// Update frame rate dynamically if source frame rate changed
+	actualFPS := vc.source.GetFrameRate()
+	if actualFPS > 0 {
+		vc.frameRate = time.Second / time.Duration(actualFPS)
+	}
+
 	sample := media.Sample{
 		Data:     frameData,
 		Duration: vc.frameRate,
@@ -117,4 +134,9 @@ func (vc *VideoCapturer) CaptureFrame() (media.Sample, error) {
 
 func (vc *VideoCapturer) Close() error {
 	return vc.source.Close()
+}
+
+// GetFrameRate returns the actual frame rate from the video source
+func (vc *VideoCapturer) GetFrameRate() int {
+	return vc.source.GetFrameRate()
 }

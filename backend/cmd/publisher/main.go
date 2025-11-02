@@ -515,13 +515,19 @@ func (p *Publisher) StartStreaming() error {
 	finalIceState := p.pc.ICEConnectionState()
 	log.Printf("Final state before streaming: PC=%s, ICE=%s", finalConnState.String(), finalIceState.String())
 
+	// Get actual frame rate from capturer (detected from stream)
+	actualFPS := p.capturer.GetFrameRate()
+	if actualFPS <= 0 {
+		actualFPS = config.AppConfig.Video.FPS
+	}
+
 	// Calculate frame interval for precise timing
-	frameRate := time.Second / time.Duration(config.AppConfig.Video.FPS)
+	frameRate := time.Second / time.Duration(actualFPS)
 	// Use high-precision ticker for perfect real-time streaming
 	ticker := time.NewTicker(frameRate)
 	defer ticker.Stop()
 
-	log.Printf("⏱️ Frame rate: %d FPS (interval: %v) - Real-time streaming enabled", config.AppConfig.Video.FPS, frameRate)
+	log.Printf("⏱️ Frame rate: %d FPS (interval: %v) - Real-time streaming enabled", actualFPS, frameRate)
 
 	frameCount := 0
 	errorCount := 0
