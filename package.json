@@ -1,0 +1,25 @@
+{
+  "name": "webrtc-streaming",
+  "version": "1.0.0",
+  "description": "WebRTC Real-Time Video Streaming",
+  "scripts": {
+    "backend:install": "cd backend && go mod download",
+    "backend:signaling": "cd backend && go run cmd/signaling/main.go",
+    "backend:publisher": "cd backend && go run cmd/publisher/main.go",
+    "frontend:install": "cd frontend && npm install",
+    "frontend:dev": "cd frontend && npm run dev",
+    "frontend:build": "cd frontend && npm run build",
+    "build": "cd frontend && npm run build",
+    "start": "cd backend && go run cmd/signaling/main.go",
+    "start:publisher": "cd backend && go run cmd/publisher/main.go"
+  },
+  "keywords": [
+    "webrtc",
+    "video-streaming",
+    "go",
+    "react"
+  ],
+  "author": "",
+  "license": "MIT"
+}
+
