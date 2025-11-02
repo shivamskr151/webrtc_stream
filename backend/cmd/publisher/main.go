@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"webrtc-streaming/internal/config"
@@ -16,12 +17,20 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+type ViewerConnection struct {
+	clientID string
+	pc       *webrtc.PeerConnection
+}
+
 type Publisher struct {
-	pc           *webrtc.PeerConnection
+	viewers      map[string]*ViewerConnection // Track connections by client ID
+	viewersMu    sync.RWMutex                 // Mutex for concurrent access to viewers map
 	wsConn       *websocket.Conn
 	signalingURL string
 	track        *webrtc.TrackLocalStaticSample
 	capturer     *video.VideoCapturer
+	api          *webrtc.API
+	webrtcConfig webrtc.Configuration
 }
 
 func NewPublisher() (*Publisher, error) {
@@ -85,21 +94,18 @@ func NewPublisher() (*Publisher, error) {
 		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(interceptorRegistry),
 	)
-	pc, err := api.NewPeerConnection(webrtcConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create peer connection: %w", err)
-	}
 
 	capturer, err := video.NewVideoCapturer()
 	if err != nil {
-		pc.Close()
 		return nil, fmt.Errorf("failed to create video capturer: %w", err)
 	}
 
 	publisher := &Publisher{
-		pc:           pc,
+		viewers:      make(map[string]*ViewerConnection),
 		signalingURL: fmt.Sprintf("ws://%s:%d/ws", config.AppConfig.SignalingServer.Host, config.AppConfig.SignalingServer.Port),
 		capturer:     capturer,
+		api:          api,
+		webrtcConfig: webrtcConfig,
 	}
 
 	// Determine codec based on video source
@@ -133,13 +139,28 @@ func NewPublisher() (*Publisher, error) {
 	}
 	publisher.track = videoTrack
 	log.Printf("✅ Created video track with codec: %s", mimeType)
+	log.Printf("   Track will be added to each viewer's peer connection")
 
-	// Add track to peer connection
-	sender, err := pc.AddTrack(videoTrack)
+	return publisher, nil
+}
+
+// createViewerConnection creates a new peer connection for a viewer
+func (p *Publisher) createViewerConnection(clientID string) (*ViewerConnection, error) {
+	log.Printf("Creating new peer connection for viewer: %s", clientID)
+
+	// Create new peer connection
+	pc, err := p.api.NewPeerConnection(p.webrtcConfig)
 	if err != nil {
+		return nil, fmt.Errorf("failed to create peer connection: %w", err)
+	}
+
+	// Create a new track instance for this viewer (can reuse the same track data source)
+	// Actually, we can use the same track instance - TrackLocalStaticSample can be added to multiple PCs
+	sender, err := pc.AddTrack(p.track)
+	if err != nil {
+		pc.Close()
 		return nil, fmt.Errorf("failed to add track: %w", err)
 	}
-	log.Println("✅ Added video track to peer connection")
 
 	// Handle RTCP packets from the receiver
 	go func() {
@@ -147,90 +168,56 @@ func NewPublisher() (*Publisher, error) {
 		for {
 			if _, _, rtcpErr := sender.Read(rtcpBuf); rtcpErr != nil {
 				if rtcpErr != io.EOF {
-					log.Printf("RTCP read error: %v", rtcpErr)
+					log.Printf("RTCP read error for viewer %s: %v", clientID, rtcpErr)
 				}
 				return
 			}
-			// Log RTCP packets for debugging (optional - can be verbose)
-			// log.Printf("RTCP packet received")
 		}
 	}()
-
-	// Verify track is ready
-	log.Printf("Track ID: %s, Kind: %s", videoTrack.ID(), videoTrack.Kind())
 
 	// Set up ICE candidate handling
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate != nil {
-			log.Printf("🧊 Local ICE candidate generated: %s", candidate.String())
-			publisher.sendICECandidate(candidate)
-		} else {
-			log.Println("✅ All local ICE candidates gathered")
+			p.sendICECandidate(candidate, clientID)
 		}
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("📡 Peer connection state changed: %s", state.String())
-		if state == webrtc.PeerConnectionStateConnected {
-			log.Println("✅ WebRTC peer connection established!")
-		} else if state == webrtc.PeerConnectionStateFailed {
-			log.Printf("❌ Peer connection failed - check network and ICE configuration")
-		} else if state == webrtc.PeerConnectionStateClosed {
-			log.Printf("❌ Peer connection closed")
+		log.Printf("📡 [%s] Peer connection state: %s", clientID, state.String())
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+			// Clean up when connection closes
+			p.removeViewer(clientID)
 		}
-	})
-
-	// Add track event handler to verify track is being sent
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("📹 Received remote track: %s, kind: %s", track.ID(), track.Kind())
-	})
-
-	// Monitor data channel state if needed
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Printf("📨 Data channel received: %s", dc.Label())
 	})
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("🧊 ICE connection state changed: %s", state.String())
+		log.Printf("🧊 [%s] ICE connection state: %s", clientID, state.String())
 		if state == webrtc.ICEConnectionStateConnected {
-			log.Println("✅ ICE connection established - media should flow now!")
-			log.Printf("   🎬 Video frames can now be transmitted to viewer")
+			log.Printf("✅ [%s] ICE connected - media flowing!", clientID)
 		} else if state == webrtc.ICEConnectionStateFailed {
-			log.Println("❌ ICE connection failed!")
-			log.Printf("   Troubleshooting:")
-			log.Printf("   1) Check firewall - ensure UDP ports are not blocked")
-			log.Printf("   2) Check network - try different network (mobile hotspot)")
-			log.Printf("   3) Consider TURN server for strict NAT/firewall")
-			log.Printf("   4) Check STUN server accessibility")
-		} else if state == webrtc.ICEConnectionStateChecking {
-			log.Printf("   ⏳ ICE checking connectivity (this can take 10-30 seconds)")
-			log.Printf("   If stuck >30s: Network/firewall may be blocking UDP")
-		} else if state == webrtc.ICEConnectionStateDisconnected {
-			log.Printf("   ⚠️ ICE disconnected!")
-			log.Printf("   Possible causes:")
-			log.Printf("   1) ICE candidates not exchanged properly")
-			log.Printf("   2) Network interruption")
-			log.Printf("   3) Firewall blocking connection")
-			log.Printf("   Checking connection state...")
-
-			// Log current state for debugging
-			pcState := pc.ConnectionState()
-			log.Printf("   PeerConnection state: %s", pcState.String())
-
-			// If we're still connected at PC level but ICE disconnected, this is unusual
-			if pcState == webrtc.PeerConnectionStateConnected {
-				log.Printf("   ⚠️ PC is connected but ICE is disconnected - media won't flow!")
-			}
-		} else if state == webrtc.ICEConnectionStateClosed {
-			log.Printf("   ❌ ICE connection closed")
+			log.Printf("❌ [%s] ICE connection failed", clientID)
 		}
 	})
 
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("📹 Received remote track: %s, kind: %s", track.ID(), track.Kind())
-	})
+	viewerConn := &ViewerConnection{
+		clientID: clientID,
+		pc:       pc,
+	}
 
-	return publisher, nil
+	return viewerConn, nil
+}
+
+func (p *Publisher) removeViewer(clientID string) {
+	p.viewersMu.Lock()
+	defer p.viewersMu.Unlock()
+
+	if viewer, exists := p.viewers[clientID]; exists {
+		if viewer.pc != nil {
+			viewer.pc.Close()
+		}
+		delete(p.viewers, clientID)
+		log.Printf("Removed viewer connection: %s", clientID)
+	}
 }
 
 func (p *Publisher) Connect() error {
@@ -254,23 +241,32 @@ func (p *Publisher) Connect() error {
 	return nil
 }
 
-func (p *Publisher) sendOffer() error {
+func (p *Publisher) sendOffer(clientID string) error {
+	p.viewersMu.RLock()
+	viewer, exists := p.viewers[clientID]
+	p.viewersMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("viewer connection not found: %s", clientID)
+	}
+
 	// Create and send offer
-	log.Println("Creating WebRTC offer...")
-	offer, err := p.pc.CreateOffer(nil)
+	log.Printf("[%s] Creating WebRTC offer...", clientID)
+	offer, err := viewer.pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("failed to create offer: %w", err)
 	}
 
-	if err := p.pc.SetLocalDescription(offer); err != nil {
+	if err := viewer.pc.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("failed to set local description: %w", err)
 	}
 
 	// Send offer through signaling server
-	log.Println("Sending offer to signaling server...")
+	log.Printf("[%s] Sending offer to viewer...", clientID)
 	// Serialize offer to match browser's RTCSessionDescription format
 	offerMsg := map[string]interface{}{
-		"type": "offer",
+		"type":     "offer",
+		"clientId": clientID,
 		"offer": map[string]interface{}{
 			"type": offer.Type.String(),
 			"sdp":  offer.SDP,
@@ -279,8 +275,7 @@ func (p *Publisher) sendOffer() error {
 	if err := p.sendMessage(offerMsg); err != nil {
 		return fmt.Errorf("failed to send offer: %w", err)
 	}
-	log.Println("✅ Offer sent successfully to viewer")
-	log.Printf("   Waiting for answer... (offer SDP length: %d bytes)", len(offer.SDP))
+	log.Printf("✅ [%s] Offer sent successfully (SDP length: %d bytes)", clientID, len(offer.SDP))
 	return nil
 }
 
@@ -315,16 +310,59 @@ func (p *Publisher) readMessages() {
 
 		switch msg["type"] {
 		case "viewer_connected":
-			log.Println("New viewer connected, sending offer...")
-			p.sendOffer()
+			// Extract client ID from message
+			clientID, ok := msg["clientId"].(string)
+			if !ok {
+				log.Printf("⚠️ viewer_connected message missing clientId")
+				continue
+			}
+
+			log.Printf("New viewer connected: %s, creating peer connection...", clientID)
+
+			// Create new peer connection for this viewer
+			viewerConn, err := p.createViewerConnection(clientID)
+			if err != nil {
+				log.Printf("❌ Failed to create peer connection for %s: %v", clientID, err)
+				continue
+			}
+
+			// Store viewer connection
+			p.viewersMu.Lock()
+			p.viewers[clientID] = viewerConn
+			p.viewersMu.Unlock()
+
+			log.Printf("✅ Created peer connection for viewer: %s", clientID)
+			log.Printf("   Active viewers: %d", len(p.viewers))
+
+			// Send offer to the new viewer
+			if err := p.sendOffer(clientID); err != nil {
+				log.Printf("❌ Failed to send offer to %s: %v", clientID, err)
+				p.removeViewer(clientID)
+			}
 
 		case "answer":
-			log.Println("📥 Received answer from viewer!")
+			// Get client ID to route to correct peer connection
+			clientID, ok := msg["clientId"].(string)
+			if !ok {
+				log.Printf("⚠️ Answer message missing clientId, cannot route")
+				continue
+			}
+
+			p.viewersMu.RLock()
+			viewer, exists := p.viewers[clientID]
+			p.viewersMu.RUnlock()
+
+			if !exists {
+				log.Printf("⚠️ Received answer from unknown viewer: %s", clientID)
+				continue
+			}
+
+			log.Printf("📥 [%s] Received answer from viewer!", clientID)
 			answerSDP := msg["answer"].(map[string]interface{})
 			sdpStr, ok := answerSDP["sdp"].(string)
 			if !ok {
-				log.Printf("❌ Answer SDP is not a string: %T", answerSDP["sdp"])
-				return
+				log.Printf("❌ [%s] Answer SDP is not a string: %T", clientID, answerSDP["sdp"])
+				continue
 			}
 
 			answer := webrtc.SessionDescription{
@@ -332,33 +370,45 @@ func (p *Publisher) readMessages() {
 				SDP:  sdpStr,
 			}
 
-			log.Printf("   Answer SDP length: %d bytes", len(sdpStr))
+			log.Printf("   [%s] Answer SDP length: %d bytes", clientID, len(sdpStr))
 
 			// CRITICAL: Set remote description BEFORE adding ICE candidates
-			if err := p.pc.SetRemoteDescription(answer); err != nil {
-				log.Printf("❌ Error setting remote description: %v", err)
-				return
+			if err := viewer.pc.SetRemoteDescription(answer); err != nil {
+				log.Printf("❌ [%s] Error setting remote description: %v", clientID, err)
+				continue
 			}
 
-			log.Println("✅ Remote description (answer) set successfully")
-			log.Printf("   Connection should start establishing now...")
+			log.Printf("✅ [%s] Remote description (answer) set successfully", clientID)
 
 			// Check if video codec is negotiated
 			if strings.Contains(answer.SDP, "H264") || strings.Contains(answer.SDP, "h264") {
-				log.Println("✅ H264 codec detected in answer SDP")
+				log.Printf("✅ [%s] H264 codec detected in answer SDP", clientID)
 			} else {
-				log.Println("⚠️ H264 codec not found in answer SDP - check codec negotiation")
+				log.Printf("⚠️ [%s] H264 codec not found in answer SDP", clientID)
 			}
 
-			log.Println("✅ WebRTC connection should establish now - ICE will negotiate")
-			log.Printf("   Current connection state: PC=%s, ICE=%s",
-				p.pc.ConnectionState().String(), p.pc.ICEConnectionState().String())
-
-			// Now that remote description is set, ICE can start gathering candidates
-			log.Println("   📡 Waiting for ICE candidates to be exchanged...")
+			log.Printf("✅ [%s] WebRTC connection should establish now - ICE will negotiate", clientID)
+			log.Printf("   [%s] Current state: PC=%s, ICE=%s",
+				clientID, viewer.pc.ConnectionState().String(), viewer.pc.ICEConnectionState().String())
 
 		case "candidate":
-			log.Println("🧊 Received ICE candidate from viewer")
+			// Get client ID to route to correct peer connection
+			clientID, ok := msg["clientId"].(string)
+			if !ok {
+				log.Printf("⚠️ Candidate message missing clientId, cannot route")
+				continue
+			}
+
+			p.viewersMu.RLock()
+			viewer, exists := p.viewers[clientID]
+			p.viewersMu.RUnlock()
+
+			if !exists {
+				log.Printf("⚠️ Received candidate from unknown viewer: %s", clientID)
+				continue
+			}
+
+			log.Printf("🧊 [%s] Received ICE candidate from viewer", clientID)
 			candidateMap := msg["candidate"].(map[string]interface{})
 			candidate := webrtc.ICECandidateInit{
 				Candidate: candidateMap["candidate"].(string),
@@ -369,12 +419,6 @@ func (p *Publisher) readMessages() {
 			}
 			if sdpMid, ok := candidateMap["sdpMid"].(string); ok {
 				candidate.SDPMid = &sdpMid
-			}
-
-			// Check if remote description is set (required before adding candidates)
-			if p.pc.RemoteDescription() == nil {
-				log.Printf("⚠️ Remote description not set yet, buffering candidate...")
-				// Buffer candidate - but this shouldn't happen if signaling is correct
 			}
 
 			// Extract candidate type for logging
@@ -388,20 +432,14 @@ func (p *Publisher) readMessages() {
 				candidateType = "relay (TURN)"
 			}
 
-			if err := p.pc.AddICECandidate(candidate); err != nil {
-				log.Printf("❌ Error adding ICE candidate (%s): %v", candidateType, err)
+			if err := viewer.pc.AddICECandidate(candidate); err != nil {
 				candidatePreview := candidateStr
 				if len(candidatePreview) > 80 {
 					candidatePreview = candidatePreview[:80]
 				}
-				log.Printf("   Candidate: %s", candidatePreview)
-				// This is critical - if we can't add candidates, connection will fail
+				log.Printf("❌ [%s] Error adding ICE candidate (%s): %v - %s", clientID, candidateType, err, candidatePreview)
 			} else {
-				candidateStrShort := candidateStr
-				if len(candidateStrShort) > 80 {
-					candidateStrShort = candidateStrShort[:80] + "..."
-				}
-				log.Printf("✅ Added remote ICE candidate (%s): %s", candidateType, candidateStrShort)
+				log.Printf("✅ [%s] Added remote ICE candidate (%s)", clientID, candidateType)
 			}
 		}
 	}
@@ -418,7 +456,7 @@ func (p *Publisher) sendMessage(msg map[string]interface{}) error {
 	return p.wsConn.WriteMessage(websocket.TextMessage, data)
 }
 
-func (p *Publisher) sendICECandidate(candidate *webrtc.ICECandidate) {
+func (p *Publisher) sendICECandidate(candidate *webrtc.ICECandidate, clientID string) {
 	if p.wsConn == nil {
 		log.Printf("⚠️ Cannot send ICE candidate - WebSocket not connected")
 		return
@@ -426,7 +464,8 @@ func (p *Publisher) sendICECandidate(candidate *webrtc.ICECandidate) {
 
 	candidateJSON := candidate.ToJSON()
 	msg := map[string]interface{}{
-		"type": "candidate",
+		"type":     "candidate",
+		"clientId": clientID,
 		"candidate": map[string]interface{}{
 			"candidate":     candidateJSON.Candidate,
 			"sdpMLineIndex": candidateJSON.SDPMLineIndex,
@@ -435,85 +474,22 @@ func (p *Publisher) sendICECandidate(candidate *webrtc.ICECandidate) {
 	}
 
 	if err := p.sendMessage(msg); err != nil {
-		log.Printf("❌ Error sending ICE candidate: %v", err)
+		log.Printf("❌ [%s] Error sending ICE candidate: %v", clientID, err)
 	} else {
 		// Log candidate type for debugging (but limit logging to avoid spam)
 		candidateStr := candidateJSON.Candidate
 		if strings.Contains(candidateStr, " typ host ") {
-			log.Printf("📤 Sent host ICE candidate (localhost)")
+			log.Printf("📤 [%s] Sent host ICE candidate (localhost)", clientID)
 		} else if strings.Contains(candidateStr, " typ srflx ") {
-			log.Printf("📤 Sent srflx ICE candidate (STUN)")
+			log.Printf("📤 [%s] Sent srflx ICE candidate (STUN)", clientID)
 		}
 	}
 }
 
 func (p *Publisher) StartStreaming() error {
 	log.Println("🎬 Starting video stream...")
-
-	// Wait for WebRTC connection to establish
-	log.Println("⏳ Waiting for WebRTC connection to establish...")
-	log.Println("   (Make sure frontend/viewer is connected and has sent answer)")
-
-	maxWait := 60 // seconds
-	connected := false
-	startTime := time.Now()
-
-	for i := 0; i < maxWait; i++ {
-		connState := p.pc.ConnectionState()
-		iceState := p.pc.ICEConnectionState()
-
-		// Check if we're fully connected
-		if connState == webrtc.PeerConnectionStateConnected &&
-			iceState == webrtc.ICEConnectionStateConnected {
-			log.Println("✅ WebRTC connection fully established!")
-			log.Printf("   PC: %s, ICE: %s (waited %.1f seconds)",
-				connState.String(), iceState.String(), time.Since(startTime).Seconds())
-			connected = true
-			break
-		}
-
-		// Check for failed states
-		if connState == webrtc.PeerConnectionStateFailed ||
-			iceState == webrtc.ICEConnectionStateFailed {
-			log.Printf("❌ Connection failed! PC: %s, ICE: %s", connState.String(), iceState.String())
-			log.Printf("   Check: 1) Is viewer connected? 2) Are ICE candidates exchanged? 3) Network/Firewall?")
-			break
-		}
-
-		if i%5 == 0 && i > 0 {
-			log.Printf("⏳ Still waiting... PC: %s, ICE: %s (waited %d/%d seconds)",
-				connState.String(), iceState.String(), i, maxWait)
-			log.Printf("   Make sure viewer has clicked 'Connect' and sent answer")
-		}
-		time.Sleep(1 * time.Second)
-	}
-
-	// Check final state
-	connState := p.pc.ConnectionState()
-	iceState := p.pc.ICEConnectionState()
-
-	if !connected {
-		if connState == webrtc.PeerConnectionStateFailed ||
-			iceState == webrtc.ICEConnectionStateFailed {
-			log.Printf("❌ Cannot start streaming - connection failed")
-			return fmt.Errorf("connection failed: PC=%s, ICE=%s", connState.String(), iceState.String())
-		}
-		log.Printf("⚠️ Warning: Connection not fully established (PC: %s, ICE: %s)",
-			connState.String(), iceState.String())
-		log.Printf("   Will attempt to stream anyway, but frames may not be transmitted")
-		log.Printf("   Ensure viewer is connected and WebRTC negotiation is complete")
-	} else {
-		log.Printf("✅ Connection ready - starting stream (PC: %s, ICE: %s)",
-			connState.String(), iceState.String())
-	}
-
-	// Additional wait to ensure everything is ready
-	log.Println("⏳ Final connection check (2 seconds)...")
-	time.Sleep(2 * time.Second)
-
-	finalConnState := p.pc.ConnectionState()
-	finalIceState := p.pc.ICEConnectionState()
-	log.Printf("Final state before streaming: PC=%s, ICE=%s", finalConnState.String(), finalIceState.String())
+	log.Println("   Video will be sent to all connected viewers")
+	log.Println("   (Streaming will start regardless of connection state - WebRTC handles buffering)")
 
 	// Get actual frame rate from capturer (detected from stream)
 	actualFPS := p.capturer.GetFrameRate()
@@ -531,7 +507,6 @@ func (p *Publisher) StartStreaming() error {
 
 	frameCount := 0
 	errorCount := 0
-	lastLogTime := time.Now()
 
 	log.Println("🎥 Starting frame capture loop...")
 	log.Println("   IMPORTANT: Transcoding HEVC→H.264 may take 5-15 seconds to produce first frame")
@@ -539,40 +514,18 @@ func (p *Publisher) StartStreaming() error {
 	log.Println("   Total wait time: 15-45 seconds before video appears")
 	log.Println("   Connection will be checked continuously - frames will buffer if not ready")
 
-	startedStreaming := false
 	lastFrameTime := time.Now()
 	maxFrameWait := 15 * time.Second // Max time to wait for first frame
 
 	for range ticker.C {
-		// Check connection state periodically
-		connState := p.pc.ConnectionState()
-		iceState := p.pc.ICEConnectionState()
+		// Check active viewers
+		p.viewersMu.RLock()
+		viewerCount := len(p.viewers)
+		p.viewersMu.RUnlock()
 
-		// Log connection state changes
-		if connState == webrtc.PeerConnectionStateConnected && iceState == webrtc.ICEConnectionStateConnected {
-			if !startedStreaming {
-				log.Println("🎉 Connection fully established! Starting to stream frames...")
-				startedStreaming = true
-			}
-		} else if connState == webrtc.PeerConnectionStateFailed || iceState == webrtc.ICEConnectionStateFailed {
-			log.Printf("❌ Connection failed! PC: %s, ICE: %s", connState.String(), iceState.String())
-			log.Printf("   Will continue attempting to stream...")
-		}
-
-		// Stream regardless of connection state - WebRTC will buffer
-		// But log warnings if not connected after initial wait
-		if !startedStreaming && connState != webrtc.PeerConnectionStateConnected && connState != webrtc.PeerConnectionStateConnecting {
-			if time.Since(lastLogTime) > 5*time.Second {
-				log.Printf("⏳ Waiting for connection... (PC: %s, ICE: %s) - frames will be buffered",
-					connState.String(), iceState.String())
-				lastLogTime = time.Now()
-			}
-		} else if startedStreaming && connState != webrtc.PeerConnectionStateConnected && connState != webrtc.PeerConnectionStateConnecting {
-			if time.Since(lastLogTime) > 10*time.Second {
-				log.Printf("⚠️ Connection lost while streaming (PC: %s, ICE: %s)",
-					connState.String(), iceState.String())
-				lastLogTime = time.Now()
-			}
+		// Log active viewers periodically
+		if frameCount%300 == 0 && viewerCount > 0 {
+			log.Printf("📊 Active viewers: %d", viewerCount)
 		}
 
 		sample, err := p.capturer.CaptureFrame()
@@ -682,13 +635,14 @@ func (p *Publisher) StartStreaming() error {
 
 		// Write sample to track (non-blocking, zero-latency real-time streaming)
 		// Always attempt write - WebRTC handles buffering internally
+		// The same track instance is used for all viewers - writing once sends to all
 		writeErr := p.track.WriteSample(sample)
 		if writeErr != nil {
 			errorCount++
 			// Minimal logging for uninterrupted streaming - only log significant issues
-			if errorCount <= 3 || (errorCount%100 == 0 && connState == webrtc.PeerConnectionStateConnected) {
+			if errorCount <= 3 || errorCount%100 == 0 {
 				log.Printf("❌ Error writing sample (count: %d): %v", errorCount, writeErr)
-				log.Printf("   Connection state: PC=%s, ICE=%s", connState.String(), iceState.String())
+				log.Printf("   Active viewers: %d", viewerCount)
 			}
 			// Continue immediately - never block, maintain perfect frame timing
 			// WebRTC's internal buffers handle temporary connection issues
@@ -701,7 +655,7 @@ func (p *Publisher) StartStreaming() error {
 
 		if frameCount == 1 {
 			log.Printf("✅ First frame written successfully! Size: %d bytes", len(sample.Data))
-			log.Printf("   Connection state: PC=%s, ICE=%s", connState.String(), iceState.String())
+			log.Printf("   Active viewers: %d", viewerCount)
 
 			// Verify H264 format
 			if len(sample.Data) >= 4 {
@@ -714,19 +668,17 @@ func (p *Publisher) StartStreaming() error {
 		}
 
 		if frameCount%30 == 0 {
-			log.Printf("✅ Streamed %d frames successfully (PC: %s, ICE: %s, last size: %d bytes)",
-				frameCount, connState.String(), iceState.String(), len(sample.Data))
+			log.Printf("✅ Streamed %d frames successfully (viewers: %d, last size: %d bytes)",
+				frameCount, viewerCount, len(sample.Data))
 		}
 
-		// Log connection state changes during streaming
-		if frameCount > 1 && (connState == webrtc.PeerConnectionStateConnected && iceState == webrtc.ICEConnectionStateConnected) {
-			if frameCount == 2 {
-				log.Printf("🎉 Stream is active! Frames are being transmitted.")
-				log.Printf("   If video doesn't display in browser, check:")
-				log.Printf("   1) Browser console for '✅ Received track'")
-				log.Printf("   2) chrome://webrtc-internals/ for packet transmission")
-				log.Printf("   3) Browser codec support (Chrome/Edge recommended for H264)")
-			}
+		// Log when streaming starts
+		if frameCount == 2 && viewerCount > 0 {
+			log.Printf("🎉 Stream is active! Frames are being transmitted to %d viewer(s).", viewerCount)
+			log.Printf("   If video doesn't display in browser, check:")
+			log.Printf("   1) Browser console for '✅ Received track'")
+			log.Printf("   2) chrome://webrtc-internals/ for packet transmission")
+			log.Printf("   3) Browser codec support (Chrome/Edge recommended for H264)")
 		}
 	}
 
@@ -737,9 +689,18 @@ func (p *Publisher) Close() {
 	if p.capturer != nil {
 		p.capturer.Close()
 	}
-	if p.pc != nil {
-		p.pc.Close()
+
+	// Close all viewer connections
+	p.viewersMu.Lock()
+	for clientID, viewer := range p.viewers {
+		if viewer.pc != nil {
+			viewer.pc.Close()
+		}
+		log.Printf("Closed connection for viewer: %s", clientID)
 	}
+	p.viewers = make(map[string]*ViewerConnection)
+	p.viewersMu.Unlock()
+
 	if p.wsConn != nil {
 		// Send proper close message before closing
 		p.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))

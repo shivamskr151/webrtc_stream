@@ -11,6 +11,7 @@ export const useWebRTC = () => {
   const candidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
   const remoteDescriptionSetRef = useRef(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const clientIdRef = useRef<string | null>(null); // Track our client ID
 
   const createPeerConnection = () => {
     // Get ICE servers from environment or use defaults
@@ -40,12 +41,15 @@ export const useWebRTC = () => {
         });
         
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'candidate',
-              candidate: event.candidate,
-            })
-          );
+          const candidateMsg: any = {
+            type: 'candidate',
+            candidate: event.candidate,
+          };
+          // Include our client ID if we know it
+          if (clientIdRef.current) {
+            candidateMsg.clientId = clientIdRef.current;
+          }
+          wsRef.current.send(JSON.stringify(candidateMsg));
           console.log('📤 Sent ICE candidate to publisher');
         } else {
           console.warn('⚠️ WebSocket not open, cannot send candidate');
@@ -330,6 +334,12 @@ export const useWebRTC = () => {
         const message = JSON.parse(event.data) as WebRTCMessage;
         console.log('📥 Received message:', message.type, message);
 
+        // Track our client ID from any message (signaling server adds it)
+        if (message.clientId && !clientIdRef.current) {
+          clientIdRef.current = message.clientId;
+          console.log('✅ Identified client ID:', message.clientId);
+        }
+
         // Ensure peer connection exists
         if (!peerConnectionRef.current) {
           console.log('Creating peer connection...');
@@ -338,6 +348,11 @@ export const useWebRTC = () => {
 
         switch (message.type) {
           case 'offer':
+            // Only process offers that are meant for us (if clientId is specified)
+            if (message.clientId && clientIdRef.current && message.clientId !== clientIdRef.current) {
+              console.log('⚠️ Ignoring offer meant for different client:', message.clientId, '(we are:', clientIdRef.current, ')');
+              break;
+            }
             console.log('📥 Received offer from publisher:', message.offer);
             if (message.offer && peerConnectionRef.current) {
               try {
@@ -366,12 +381,15 @@ export const useWebRTC = () => {
                 console.log('✅ Local description set');
                 
                 console.log('Sending answer to publisher...');
-                ws.send(
-                  JSON.stringify({
-                    type: 'answer',
-                    answer: answer,
-                  })
-                );
+                const answerMsg: any = {
+                  type: 'answer',
+                  answer: answer,
+                };
+                // Include our client ID if we know it
+                if (clientIdRef.current) {
+                  answerMsg.clientId = clientIdRef.current;
+                }
+                ws.send(JSON.stringify(answerMsg));
                 console.log('✅ Answer sent, waiting for ICE connection...');
               } catch (error) {
                 console.error('Error handling offer:', error);
@@ -388,6 +406,12 @@ export const useWebRTC = () => {
             break;
 
           case 'candidate':
+            // Only process candidates that are meant for us (if clientId is specified)
+            if (message.clientId && clientIdRef.current && message.clientId !== clientIdRef.current) {
+              console.log('⚠️ Ignoring candidate meant for different client:', message.clientId);
+              break;
+            }
+
             if (message.candidate && peerConnectionRef.current) {
               try {
                 // Handle both formats: direct candidate object or nested candidate

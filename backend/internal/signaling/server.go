@@ -190,8 +190,13 @@ func (c *Client) readPump() {
 			continue
 		}
 
-		// Add client ID
-		rawMsg["clientId"] = c.clientID
+		// Add sender's client ID as "fromClientId" to preserve target "clientId" if present
+		// If clientId is not already in the message (from sender), add it as the sender's ID
+		if _, exists := rawMsg["clientId"]; !exists {
+			rawMsg["clientId"] = c.clientID
+		}
+		// Always include sender ID for routing
+		rawMsg["fromClientId"] = c.clientID
 
 		// Convert back to JSON and create Message
 		messageBytes, err = json.Marshal(rawMsg)
