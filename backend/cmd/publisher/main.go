@@ -515,9 +515,13 @@ func (p *Publisher) StartStreaming() error {
 	finalIceState := p.pc.ICEConnectionState()
 	log.Printf("Final state before streaming: PC=%s, ICE=%s", finalConnState.String(), finalIceState.String())
 
+	// Calculate frame interval for precise timing
 	frameRate := time.Second / time.Duration(config.AppConfig.Video.FPS)
+	// Use high-precision ticker for perfect real-time streaming
 	ticker := time.NewTicker(frameRate)
 	defer ticker.Stop()
+
+	log.Printf("⏱️ Frame rate: %d FPS (interval: %v) - Real-time streaming enabled", config.AppConfig.Video.FPS, frameRate)
 
 	frameCount := 0
 	errorCount := 0
@@ -610,21 +614,18 @@ func (p *Publisher) StartStreaming() error {
 			log.Printf("   Next step: Frame will be written to WebRTC track")
 		}
 
-		// Write sample to track (non-blocking, continues on error for smooth streaming)
-		// WriteSample may return errors if connection isn't ready, but we continue anyway
+		// Write sample to track (non-blocking, zero-latency real-time streaming)
+		// Always attempt write - WebRTC handles buffering internally
 		writeErr := p.track.WriteSample(sample)
 		if writeErr != nil {
 			errorCount++
-			// Reduced logging for smoother operation - log less frequently
-			if errorCount <= 5 || (errorCount%50 == 0) {
+			// Minimal logging for uninterrupted streaming - only log significant issues
+			if errorCount <= 3 || (errorCount%100 == 0 && connState == webrtc.PeerConnectionStateConnected) {
 				log.Printf("❌ Error writing sample (count: %d): %v", errorCount, writeErr)
 				log.Printf("   Connection state: PC=%s, ICE=%s", connState.String(), iceState.String())
-				if errorCount <= 5 {
-					log.Printf("   ⚠️ Initial errors are normal if connection isn't ready yet")
-				}
 			}
-			// Continue immediately - don't block, keep frame rate consistent
-			// WebRTC will buffer once connection is ready
+			// Continue immediately - never block, maintain perfect frame timing
+			// WebRTC's internal buffers handle temporary connection issues
 			continue
 		}
 

@@ -28,12 +28,12 @@ type RTSPVideoSource struct {
 func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
 	return &RTSPVideoSource{
 		rtspURL:      rtspURL,
-		frameChan:    make(chan []byte, 3), // Small buffer to minimize latency, use smart dropping
+		frameChan:    make(chan []byte, 1), // Single frame buffer for zero-latency real-time streaming
 		errChan:      make(chan error, 1),
-		accessUnit:   make([]byte, 0, 256*1024), // Reduced from 512KB
+		accessUnit:   make([]byte, 0, 128*1024), // Further reduced for minimal latency
 		spsPps:       make([]byte, 0, 1024),
 		spsPpsFound:  false,
-		currentFrame: make([]byte, 0, 128*1024), // Reduced from 256KB
+		currentFrame: make([]byte, 0, 64*1024), // Minimal frame buffer
 	}, nil
 }
 
@@ -128,9 +128,9 @@ func (r *RTSPVideoSource) readFrames() {
 	defer close(r.errChan)
 
 	// H264 NAL Unit start codes: 0x00000001 or 0x000001
-	buffer := make([]byte, 0, 256*1024)              // 256KB initial buffer (reduced for lower latency)
-	reader := bufio.NewReaderSize(r.stdout, 32*1024) // 32KB read buffer (reduced)
-	chunk := make([]byte, 16*1024)                   // Read 16KB chunks (reduced)
+	buffer := make([]byte, 0, 128*1024)              // 128KB initial buffer (minimal for zero-latency)
+	reader := bufio.NewReaderSize(r.stdout, 16*1024) // 16KB read buffer (minimal)
+	chunk := make([]byte, 8*1024)                    // Read 8KB chunks (minimal for real-time)
 
 	for {
 		r.mu.Lock()
@@ -337,31 +337,32 @@ func (r *RTSPVideoSource) readFrames() {
 							}
 
 							frameQueueCounter++
-							// Smart frame dropping: drop old frames when buffer is full, keep latest
+							// Zero-latency real-time: Always keep only the latest frame
+							// Drop any old frame immediately and replace with newest
 							select {
 							case r.frameChan <- frameToSend:
+								// Frame sent successfully
 								if frameQueueCounter <= 10 {
 									log.Printf("📤 Queued complete access unit #%d: %d bytes", frameQueueCounter, len(frameToSend))
 								}
 							default:
-								// Channel is full - drop the oldest frame and add the new one
-								// This ensures we always show the latest video without stuttering
+								// Channel is full - immediately replace with newest frame (drop old one)
+								// This ensures perfectly real-time streaming with zero buffering delays
 								select {
-								case <-r.frameChan: // Remove oldest frame
+								case oldFrame := <-r.frameChan: // Remove and discard old frame
+									_ = oldFrame // Explicitly discard old frame
 									select {
-									case r.frameChan <- frameToSend: // Add new frame
-										droppedCount := frameQueueCounter - 10
-										if droppedCount%50 == 0 {
-											log.Printf("⚡ Dropped old frame (frame #%d), keeping latest - reducing latency", frameQueueCounter)
+									case r.frameChan <- frameToSend: // Add newest frame
+										// Successfully replaced old frame with new one
+										if frameQueueCounter%100 == 0 {
+											log.Printf("⚡ Real-time: Replaced old frame #%d with latest - zero buffering", frameQueueCounter)
 										}
 									default:
-										// Shouldn't happen, but log if it does
-										if frameQueueCounter%100 == 0 {
-											log.Printf("⚠️ Unable to replace frame in channel")
-										}
+										// Extremely rare - channel filled between operations
+										// Log but continue (shouldn't happen with size 1)
 									}
 								default:
-									// Channel already empty (shouldn't happen)
+									// Channel became empty between checks - send new frame
 									r.frameChan <- frameToSend
 								}
 							}
@@ -473,10 +474,10 @@ func (r *RTSPVideoSource) readFrames() {
 				break
 			}
 
-			// Prevent buffer from growing too large - reduced for lower latency
-			if len(buffer) > 1024*1024 { // 1MB max (reduced from 2MB)
-				// Keep only last 512KB (reduced from 1MB)
-				buffer = buffer[len(buffer)-512*1024:]
+			// Prevent buffer from growing - aggressive limit for zero-latency
+			if len(buffer) > 512*1024 { // 512KB max (minimal for real-time)
+				// Keep only last 256KB (immediate processing)
+				buffer = buffer[len(buffer)-256*1024:]
 			}
 		}
 	}
@@ -521,126 +522,13 @@ var (
 )
 
 func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
-	// Reduced timeout for faster recovery and lower latency
-	timeout := time.After(3 * time.Second)
+	// Zero-latency real-time: Try to get frame immediately, very short timeout
+	// If no frame available, wait briefly but don't block long
+	timeout := time.After(100 * time.Millisecond) // Ultra-short timeout for real-time
 
 	select {
 	case frame := <-r.frameChan:
-		frameReadCount++
-		if frame == nil {
-			return nil, fmt.Errorf("frame channel closed")
-		}
-		if len(frame) == 0 {
-			// Skip empty frames, try again
-			return r.ReadFrame()
-		}
-
-		// For the very first frame, ensure it has SPS/PPS
-		// Pion WebRTC needs SPS/PPS before the first IDR frame
-		if !firstFrameSent && len(frame) >= 8 {
-			// Check if this frame starts with SPS/PPS
-			hasSpsPps := false
-			if len(frame) >= 8 {
-				// Look for SPS (type 7) or PPS (type 8) in the first 500 bytes
-				checkLen := len(frame)
-				if checkLen > 500 {
-					checkLen = 500
-				}
-				for i := 0; i < checkLen-4; i++ {
-					if frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
-						if i+4 < len(frame) {
-							nalType := frame[i+4] & 0x1F
-							if nalType == 7 || nalType == 8 {
-								hasSpsPps = true
-								break
-							}
-						}
-					} else if frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01 {
-						if i+3 < len(frame) {
-							nalType := frame[i+3] & 0x1F
-							if nalType == 7 || nalType == 8 {
-								hasSpsPps = true
-								break
-							}
-						}
-					}
-				}
-			}
-
-			if !hasSpsPps {
-				// First frame doesn't have SPS/PPS
-				// After transcoding starts, libx264 should produce frames with SPS/PPS
-				// But if we wait too long, skip the check after 5 attempts
-				if frameReadCount <= 5 {
-					log.Printf("⚠️ First frame doesn't contain SPS/PPS (attempt %d), skipping and waiting...", frameReadCount)
-					return r.ReadFrame()
-				} else {
-					log.Printf("⚠️ No SPS/PPS found after 5 attempts, sending frame anyway (transcoding may still be initializing)")
-					// Continue anyway - transcoding might need more time
-				}
-			}
-			firstFrameSent = true
-			log.Printf("✅ First frame ready: %d bytes (SPS/PPS: %v)", len(frame), hasSpsPps)
-		}
-
-		if len(frame) < 8 {
-			// Skip very small frames (not valid NAL units)
-			if frameReadCount%100 == 0 {
-				log.Printf("Skipping small frame: %d bytes", len(frame))
-			}
-			return r.ReadFrame()
-		}
-
-		// Log first few frames for debugging
-		if frameReadCount <= 5 || frameReadCount%100 == 0 {
-			nalTypes := []string{}
-			// Parse all NAL units in the access unit
-			i := 0
-			for i < len(frame) {
-				if i+4 <= len(frame) && frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
-					// 4-byte start code
-					if i+4 < len(frame) {
-						nalTypeByte := frame[i+4] & 0x1F
-						switch nalTypeByte {
-						case 1:
-							nalTypes = append(nalTypes, "P/B")
-						case 5:
-							nalTypes = append(nalTypes, "IDR")
-						case 7:
-							nalTypes = append(nalTypes, "SPS")
-						case 8:
-							nalTypes = append(nalTypes, "PPS")
-						default:
-							nalTypes = append(nalTypes, fmt.Sprintf("NAL%d", nalTypeByte))
-						}
-					}
-					i += 4
-				} else if i+3 <= len(frame) && frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01 {
-					// 3-byte start code
-					if i+3 < len(frame) {
-						nalTypeByte := frame[i+3] & 0x1F
-						switch nalTypeByte {
-						case 1:
-							nalTypes = append(nalTypes, "P/B")
-						case 5:
-							nalTypes = append(nalTypes, "IDR")
-						case 7:
-							nalTypes = append(nalTypes, "SPS")
-						case 8:
-							nalTypes = append(nalTypes, "PPS")
-						default:
-							nalTypes = append(nalTypes, fmt.Sprintf("NAL%d", nalTypeByte))
-						}
-					}
-					i += 3
-				} else {
-					i++
-				}
-			}
-			log.Printf("📹 RTSP access unit #%d: %d bytes, NALs: %v", frameReadCount, len(frame), nalTypes)
-		}
-
-		return frame, nil
+		return r.processFrame(frame)
 	case err := <-r.errChan:
 		if err != nil {
 			log.Printf("RTSP error: %v", err)
@@ -648,16 +536,135 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 		}
 		return nil, fmt.Errorf("error channel closed")
 	case <-timeout:
-		log.Printf("⚠️ Timeout waiting for RTSP frame (waited 3s)")
-		log.Printf("   Frame channel length: %d", len(r.frameChan))
-		log.Printf("   This might mean:")
-		log.Printf("   1) FFmpeg is still transcoding first frame")
-		log.Printf("   2) NAL unit parsing needs more data")
-		log.Printf("   3) Frame channel may be empty")
-		log.Printf("   Will retry...")
-		// Retry immediately for continuous streaming
+		// Very short timeout - check if channel has frame now (non-blocking check)
+		select {
+		case frame := <-r.frameChan:
+			// Got frame immediately after timeout - process it
+			return r.processFrame(frame)
+		default:
+			// No frame available - retry immediately for continuous real-time streaming
+			return r.ReadFrame()
+		}
+	}
+}
+
+// processFrame handles frame processing logic separately for reusability
+func (r *RTSPVideoSource) processFrame(frame []byte) ([]byte, error) {
+	frameReadCount++
+	if frame == nil {
+		return nil, fmt.Errorf("frame channel closed")
+	}
+	if len(frame) == 0 {
+		// Skip empty frames, try again immediately
 		return r.ReadFrame()
 	}
+
+	// For the very first frame, ensure it has SPS/PPS
+	// Pion WebRTC needs SPS/PPS before the first IDR frame
+	if !firstFrameSent && len(frame) >= 8 {
+		// Check if this frame starts with SPS/PPS
+		hasSpsPps := false
+		if len(frame) >= 8 {
+			// Look for SPS (type 7) or PPS (type 8) in the first 500 bytes
+			checkLen := len(frame)
+			if checkLen > 500 {
+				checkLen = 500
+			}
+			for i := 0; i < checkLen-4; i++ {
+				if frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
+					if i+4 < len(frame) {
+						nalType := frame[i+4] & 0x1F
+						if nalType == 7 || nalType == 8 {
+							hasSpsPps = true
+							break
+						}
+					}
+				} else if frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01 {
+					if i+3 < len(frame) {
+						nalType := frame[i+3] & 0x1F
+						if nalType == 7 || nalType == 8 {
+							hasSpsPps = true
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if !hasSpsPps {
+			// First frame doesn't have SPS/PPS
+			// After transcoding starts, libx264 should produce frames with SPS/PPS
+			// But if we wait too long, skip the check after 5 attempts
+			if frameReadCount <= 5 {
+				log.Printf("⚠️ First frame doesn't contain SPS/PPS (attempt %d), skipping and waiting...", frameReadCount)
+				return r.ReadFrame()
+			} else {
+				log.Printf("⚠️ No SPS/PPS found after 5 attempts, sending frame anyway (transcoding may still be initializing)")
+				// Continue anyway - transcoding might need more time
+			}
+		}
+		firstFrameSent = true
+		log.Printf("✅ First frame ready: %d bytes (SPS/PPS: %v)", len(frame), hasSpsPps)
+	}
+
+	if len(frame) < 8 {
+		// Skip very small frames (not valid NAL units)
+		if frameReadCount%100 == 0 {
+			log.Printf("Skipping small frame: %d bytes", len(frame))
+		}
+		return r.ReadFrame()
+	}
+
+	// Log first few frames for debugging
+	if frameReadCount <= 5 || frameReadCount%100 == 0 {
+		nalTypes := []string{}
+		// Parse all NAL units in the access unit
+		i := 0
+		for i < len(frame) {
+			if i+4 <= len(frame) && frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
+				// 4-byte start code
+				if i+4 < len(frame) {
+					nalTypeByte := frame[i+4] & 0x1F
+					switch nalTypeByte {
+					case 1:
+						nalTypes = append(nalTypes, "P/B")
+					case 5:
+						nalTypes = append(nalTypes, "IDR")
+					case 7:
+						nalTypes = append(nalTypes, "SPS")
+					case 8:
+						nalTypes = append(nalTypes, "PPS")
+					default:
+						nalTypes = append(nalTypes, fmt.Sprintf("NAL%d", nalTypeByte))
+					}
+				}
+				i += 4
+			} else if i+3 <= len(frame) && frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01 {
+				// 3-byte start code
+				if i+3 < len(frame) {
+					nalTypeByte := frame[i+3] & 0x1F
+					switch nalTypeByte {
+					case 1:
+						nalTypes = append(nalTypes, "P/B")
+					case 5:
+						nalTypes = append(nalTypes, "IDR")
+					case 7:
+						nalTypes = append(nalTypes, "SPS")
+					case 8:
+						nalTypes = append(nalTypes, "PPS")
+					default:
+						nalTypes = append(nalTypes, fmt.Sprintf("NAL%d", nalTypeByte))
+					}
+				}
+				i += 3
+			} else {
+				i++
+			}
+		}
+		log.Printf("📹 RTSP access unit #%d: %d bytes, NALs: %v", frameReadCount, len(frame), nalTypes)
+	}
+
+	return frame, nil
 }
 
 func (r *RTSPVideoSource) Close() error {
