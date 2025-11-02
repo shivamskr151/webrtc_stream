@@ -579,6 +579,39 @@ func (p *Publisher) StartStreaming() error {
 		if err != nil {
 			errorCount++
 
+			// Check if error indicates FFmpeg has failed permanently
+			// Only treat as fatal if it's an actual FFmpeg process failure, not temporary "no frame available"
+			errStr := err.Error()
+			isFatalError := false
+
+			// Only treat these specific error patterns as fatal (actual FFmpeg failures):
+			// - "FFmpeg process exited"
+			// - "FFmpeg critical error"
+			// - "FFmpeg stdout closed"
+			// - "FFmpeg may have failed or exited" (from channel closed errors)
+			// - "channel closed" (when it indicates FFmpeg failure)
+			// BUT NOT: "no frame available" which is just a temporary condition
+			if strings.Contains(errStr, "FFmpeg process exited") ||
+				strings.Contains(errStr, "FFmpeg critical error") ||
+				strings.Contains(errStr, "FFmpeg stdout closed") ||
+				strings.Contains(errStr, "FFmpeg may have failed") ||
+				(strings.Contains(errStr, "channel closed") &&
+					!strings.Contains(errStr, "no frame available")) {
+				isFatalError = true
+			}
+
+			// For fatal errors, log immediately and check if we should stop
+			if isFatalError {
+				log.Printf("❌ Fatal error detected (count: %d): %v", errorCount, err)
+				log.Printf("   FFmpeg process appears to have failed - check RTSP stream availability")
+
+				// If we haven't received any frames and error persists, stop after threshold
+				if frameCount == 0 && errorCount >= 60 { // ~2 seconds at 30fps
+					log.Printf("❌ Stopping stream: FFmpeg failed and no frames received after %d attempts", errorCount)
+					return fmt.Errorf("FFmpeg failed: %w (no frames captured after %d attempts)", err, errorCount)
+				}
+			}
+
 			// Check if we've been waiting too long for first frame
 			if frameCount == 0 && time.Since(lastFrameTime) > maxFrameWait {
 				log.Printf("⚠️ No frames captured after %.0f seconds", maxFrameWait.Seconds())
@@ -586,14 +619,41 @@ func (p *Publisher) StartStreaming() error {
 				log.Printf("   1) FFmpeg transcoding is still initializing (HEVC→H.264 takes time)")
 				log.Printf("   2) RTSP stream is not accessible")
 				log.Printf("   3) FFmpeg encountered an error")
+				log.Printf("   Error: %v", err)
+
+				// If it's a fatal error and we've waited too long, stop
+				if isFatalError {
+					log.Printf("❌ FFmpeg fatal error persists - stopping stream")
+					return fmt.Errorf("FFmpeg fatal error after waiting %.0f seconds: %w", maxFrameWait.Seconds(), err)
+				}
+
 				log.Printf("   Will continue waiting...")
 				lastFrameTime = time.Now() // Reset timer
 			}
 
 			// For continuous streaming, don't log every error (reduces spam)
-			if errorCount%30 == 0 {
+			// Log fatal errors immediately, but for temporary errors (like "no frame available"),
+			// only log periodically to avoid spam, especially if we're already streaming successfully
+			if isFatalError {
+				// Always log fatal errors immediately
 				log.Printf("❌ Error capturing frame (count: %d): %v", errorCount, err)
-				log.Printf("   Continuing stream - will retry next frame...")
+			} else if frameCount == 0 {
+				// During initialization, log temporary errors periodically
+				if errorCount%30 == 0 {
+					log.Printf("⚠️ Temporary error capturing frame (count: %d): %v", errorCount, err)
+					log.Printf("   Continuing stream - will retry next frame...")
+				}
+			} else {
+				// After we've successfully streamed frames, suppress "no frame available" errors
+				// as they're just temporary gaps between frames
+				if !strings.Contains(errStr, "no frame available") {
+					// Log other temporary errors periodically
+					if errorCount%60 == 0 {
+						log.Printf("⚠️ Temporary error capturing frame (count: %d): %v", errorCount, err)
+						log.Printf("   Continuing stream - will retry next frame...")
+					}
+				}
+				// Completely suppress "no frame available" errors when already streaming
 			}
 			// Don't skip ticker - continue immediately to keep frame rate consistent
 			continue

@@ -63,6 +63,7 @@ func (r *RTSPVideoSource) Start() error {
 		"-strict", "experimental",
 		"-analyzeduration", "500000", // Reduce analysis time (0.5 second) - faster startup
 		"-probesize", "500000", // Reduce probe size - faster startup
+		"-err_detect", "ignore_err", // Ignore non-critical decoding errors (common when joining HEVC mid-stream)
 		"-i", r.rtspURL,
 		// Transcode to H.264 (works for both H.264 and HEVC input)
 		// Use hardware acceleration if available (videotoolbox on macOS)
@@ -106,14 +107,49 @@ func (r *RTSPVideoSource) Start() error {
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	// Track if we've detected a critical FFmpeg error
+	var ffmpegError error
+	var ffmpegErrorMutex sync.Mutex
+
 	// Log stderr in a goroutine for debugging and extract frame rate
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			// Log important ffmpeg messages
+			// Filter out common HEVC decoder warnings that are expected when joining mid-stream
+			// These are non-critical and just create log spam
 			if len(line) > 0 {
-				log.Printf("ffmpeg: %s", line)
+				// Skip repetitive HEVC decoder warnings that are normal when joining mid-stream
+				// These warnings occur because FFmpeg needs to wait for a keyframe to decode properly
+				// They are non-critical - FFmpeg will automatically skip undecodable frames until it finds a keyframe
+				lowerLine := strings.ToLower(line)
+				isHEVCWarning := strings.Contains(lowerLine, "[hevc @") && (strings.Contains(lowerLine, "could not find ref with poc") ||
+					strings.Contains(lowerLine, "error constructing the frame rps") ||
+					strings.Contains(lowerLine, "skipping invalid undecodable nalu") ||
+					strings.Contains(lowerLine, "pps id out of range"))
+
+				// Also filter swscaler warnings about color conversion (non-critical performance info)
+				isScalerWarning := strings.Contains(lowerLine, "[swscaler @") &&
+					strings.Contains(lowerLine, "no accelerated colorspace conversion")
+
+				// Skip non-critical warnings but log important messages
+				if !isHEVCWarning && !isScalerWarning {
+					log.Printf("ffmpeg: %s", line)
+				}
+
+				// Detect critical errors early (404, connection refused, etc.)
+				// (lowerLine already defined above)
+				if strings.Contains(lowerLine, "404 not found") ||
+					strings.Contains(lowerLine, "connection refused") ||
+					strings.Contains(lowerLine, "failed") ||
+					strings.Contains(lowerLine, "error opening input") {
+					ffmpegErrorMutex.Lock()
+					if ffmpegError == nil {
+						ffmpegError = fmt.Errorf("FFmpeg critical error: %s", line)
+						log.Printf("❌ FFmpeg error detected: %s", line)
+					}
+					ffmpegErrorMutex.Unlock()
+				}
 
 				// Extract frame rate from ffmpeg output (e.g., "15 fps")
 				if strings.Contains(line, " fps") || strings.Contains(line, " tbr") {
@@ -142,6 +178,61 @@ func (r *RTSPVideoSource) Start() error {
 		return fmt.Errorf("failed to start ffmpeg: %w", err)
 	}
 
+	// Monitor FFmpeg process exit in a separate goroutine
+	go func() {
+		err := cmd.Wait()
+		ffmpegErrorMutex.Lock()
+		hasError := ffmpegError != nil
+		storedError := ffmpegError
+		ffmpegErrorMutex.Unlock()
+
+		if err != nil {
+			// FFmpeg exited with error
+			if !hasError {
+				// If we didn't already capture an error from stderr, use the exit error
+				storedError = fmt.Errorf("FFmpeg process exited with error: %w", err)
+			}
+			log.Printf("❌ FFmpeg process exited: %v", storedError)
+		} else {
+			log.Printf("⚠️ FFmpeg process exited normally (unexpected)")
+			if !hasError {
+				storedError = fmt.Errorf("FFmpeg process exited unexpectedly")
+			}
+		}
+
+		// Send error to errChan so ReadFrame can detect it
+		// Use recover to prevent panic if channel is already closed
+		if storedError != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Channel was closed - this is expected if readFrames exited first
+						log.Printf("⚠️ Could not send FFmpeg error to channel (already closed): %v", storedError)
+					}
+				}()
+
+				// Check if source is closed before attempting to send
+				r.mu.Lock()
+				isClosed := r.closed
+				r.mu.Unlock()
+
+				if !isClosed {
+					select {
+					case r.errChan <- storedError:
+						// Successfully sent error
+					default:
+						// Channel might be full or closed (non-blocking)
+					}
+				}
+			}()
+		}
+
+		// Close stdout to signal readFrames that input is done
+		if r.stdout != nil {
+			r.stdout.Close()
+		}
+	}()
+
 	// Start reading frames in a goroutine
 	go r.readFrames()
 
@@ -168,15 +259,45 @@ func (r *RTSPVideoSource) readFrames() {
 		// Read chunk
 		n, err := reader.Read(chunk)
 		if err != nil {
+			// Helper function to safely send to error channel
+			sendErrorSafely := func(errMsg string) {
+				defer func() {
+					if r := recover(); r != nil {
+						// Channel was closed - this is expected during shutdown
+					}
+				}()
+				select {
+				case r.errChan <- fmt.Errorf("%s", errMsg):
+				default:
+					// Channel might be full or closed
+				}
+			}
+
+			// Helper function to safely send frame
+			sendFrameSafely := func(frame []byte) {
+				defer func() {
+					if r := recover(); r != nil {
+						// Channel was closed - this is expected during shutdown
+					}
+				}()
+				select {
+				case r.frameChan <- frame:
+				default:
+					// Channel might be full or closed
+				}
+			}
+
 			if err != io.EOF {
-				r.errChan <- fmt.Errorf("failed to read chunk: %w", err)
+				// Only send error if channel is not already closed
+				sendErrorSafely(fmt.Sprintf("failed to read from FFmpeg stdout: %v (FFmpeg may have exited)", err))
+			} else {
+				// EOF means FFmpeg closed its stdout
+				// Send error to indicate FFmpeg exited
+				sendErrorSafely("FFmpeg stdout closed (EOF) - process may have exited")
 			}
 			// Process remaining buffer before returning
 			if len(buffer) > 0 {
-				select {
-				case r.frameChan <- buffer:
-				default:
-				}
+				sendFrameSafely(buffer)
 			}
 			return
 		}
@@ -331,11 +452,38 @@ func (r *RTSPVideoSource) readFrames() {
 
 						// Check if this is a picture frame (IDR or P/B) or AUD delimiter
 						isPictureFrame := nalTypeByte == 5 || nalTypeByte == 1
+						isIDR := nalTypeByte == 5
 						isAUD := nalTypeByte == 9 // Access Unit Delimiter
 
-						// If we encounter AUD or a new picture frame and have accumulated a previous frame, send it
-						if (isAUD || isPictureFrame) && len(r.currentFrame) > 0 {
-							// Send the previous complete frame
+						// Send frame when:
+						// 1. AUD encountered (marks end of access unit)
+						// 2. New picture frame encountered AND we have a previous frame to send
+						// 3. IDR frame encountered (always send IDRs immediately, even if first frame)
+						shouldSendFrame := false
+						if isAUD {
+							// AUD marks end of access unit - send current frame if we have one
+							shouldSendFrame = len(r.currentFrame) > 0
+						} else if isPictureFrame {
+							// For picture frames:
+							// - Always send if it's an IDR (first frame or keyframe)
+							// - Send previous frame if we have one accumulated
+							if isIDR {
+								// IDR frames should be sent immediately (especially the first one)
+								// If we have accumulated data, send it first, then start accumulating the IDR
+								if len(r.currentFrame) > 0 {
+									shouldSendFrame = true
+								} else {
+									// No previous frame, but we should still send this IDR once accumulated
+									// Don't send yet - add the IDR to currentFrame first
+								}
+							} else if len(r.currentFrame) > 0 {
+								// P/B frame encountered - send previous frame
+								shouldSendFrame = true
+							}
+						}
+
+						if shouldSendFrame {
+							// Send the accumulated frame
 							var frameToSend []byte
 
 							// Check if current frame contains an IDR (NAL type 5) anywhere
@@ -372,13 +520,14 @@ func (r *RTSPVideoSource) readFrames() {
 								}
 							}
 
-							if hasIDR {
+							if hasIDR && len(r.spsPps) > 0 {
 								// Prepend SPS/PPS to IDR frame
 								frameToSend = make([]byte, len(r.spsPps)+len(r.currentFrame))
 								copy(frameToSend, r.spsPps)
 								copy(frameToSend[len(r.spsPps):], r.currentFrame)
 							} else {
-								frameToSend = r.currentFrame
+								frameToSend = make([]byte, len(r.currentFrame))
+								copy(frameToSend, r.currentFrame)
 							}
 
 							frameQueueCounter++
@@ -419,9 +568,77 @@ func (r *RTSPVideoSource) readFrames() {
 						if isAUD {
 							// AUD marks end of access unit - frame should have been sent above
 							// Don't add AUD to frame, it's just a delimiter
+							// However, if we have an accumulated frame but haven't sent it, send it now
+							if len(r.currentFrame) > 0 && !shouldSendFrame {
+								// We have a frame but AUD didn't trigger send - send it now
+								var frameToSend []byte
+								if len(r.spsPps) > 0 {
+									// Check if currentFrame has IDR
+									hasIDR := false
+									for i := 0; i < len(r.currentFrame)-3; i++ {
+										if r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x00 && r.currentFrame[i+3] == 0x01 {
+											if i+4 < len(r.currentFrame) {
+												nalType := r.currentFrame[i+4] & 0x1F
+												if nalType == 5 {
+													hasIDR = true
+													break
+												}
+											}
+										} else if i+2 < len(r.currentFrame) && r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x01 {
+											if i+3 < len(r.currentFrame) {
+												nalType := r.currentFrame[i+3] & 0x1F
+												if nalType == 5 {
+													hasIDR = true
+													break
+												}
+											}
+										}
+									}
+									if hasIDR {
+										frameToSend = make([]byte, len(r.spsPps)+len(r.currentFrame))
+										copy(frameToSend, r.spsPps)
+										copy(frameToSend[len(r.spsPps):], r.currentFrame)
+									} else {
+										frameToSend = make([]byte, len(r.currentFrame))
+										copy(frameToSend, r.currentFrame)
+									}
+								} else {
+									frameToSend = make([]byte, len(r.currentFrame))
+									copy(frameToSend, r.currentFrame)
+								}
+								// Send the frame
+								select {
+								case r.frameChan <- frameToSend:
+									frameQueueCounter++
+									if frameQueueCounter <= 10 {
+										log.Printf("📤 Queued complete access unit #%d (via AUD): %d bytes", frameQueueCounter, len(frameToSend))
+									}
+								default:
+									// Channel full, replace
+									select {
+									case <-r.frameChan:
+										r.frameChan <- frameToSend
+										frameQueueCounter++
+									default:
+										r.frameChan <- frameToSend
+										frameQueueCounter++
+									}
+								}
+								r.currentFrame = r.currentFrame[:0]
+							}
 						} else if isPictureFrame {
 							// Start accumulating NAL units for this new frame
+							wasEmpty := len(r.currentFrame) == 0
 							r.currentFrame = append(r.currentFrame, nalUnit...)
+
+							// Special case: If this is the first IDR frame and we have SPS/PPS,
+							// we should send it after accumulating (when next NAL or timeout)
+							// But for now, if we just started accumulating an IDR and we have SPS/PPS,
+							// mark that we should check on next iteration
+							if wasEmpty && isIDR && len(r.spsPps) > 0 {
+								// First IDR frame with SPS/PPS - will be sent when next NAL arrives
+								// or after a short delay if no more NALs come
+							}
 						} else if nalTypeByte == 7 || nalTypeByte == 8 {
 							// SPS/PPS - accumulate for next access unit
 							r.accessUnit = append(r.accessUnit, nalUnit...)
@@ -493,6 +710,57 @@ func (r *RTSPVideoSource) readFrames() {
 
 			if !found {
 				// No more start codes found in current buffer
+				// Before breaking, check if we have an accumulated IDR frame that should be sent
+				// This handles the case where we've accumulated a complete IDR but haven't encountered
+				// an AUD or next picture frame yet
+				if len(r.currentFrame) > 0 && len(r.spsPps) > 0 && frameQueueCounter == 0 {
+					// Check if currentFrame contains an IDR
+					hasIDR := false
+					for i := 0; i < len(r.currentFrame)-3; i++ {
+						if r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x00 && r.currentFrame[i+3] == 0x01 {
+							if i+4 < len(r.currentFrame) {
+								nalType := r.currentFrame[i+4] & 0x1F
+								if nalType == 5 {
+									hasIDR = true
+									break
+								}
+							}
+						} else if i+2 < len(r.currentFrame) && r.currentFrame[i] == 0x00 && r.currentFrame[i+1] == 0x00 && r.currentFrame[i+2] == 0x01 {
+							if i+3 < len(r.currentFrame) {
+								nalType := r.currentFrame[i+3] & 0x1F
+								if nalType == 5 {
+									hasIDR = true
+									break
+								}
+							}
+						}
+					}
+					// If we have an IDR frame with sufficient size, send it
+					if hasIDR && len(r.currentFrame) > 100 {
+						frameToSend := make([]byte, len(r.spsPps)+len(r.currentFrame))
+						copy(frameToSend, r.spsPps)
+						copy(frameToSend[len(r.spsPps):], r.currentFrame)
+						select {
+						case r.frameChan <- frameToSend:
+							frameQueueCounter++
+							log.Printf("📤 Queued first IDR frame (complete): %d bytes", len(frameToSend))
+						default:
+							// Channel full, but this is first frame so clear and send
+							select {
+							case <-r.frameChan:
+								r.frameChan <- frameToSend
+								frameQueueCounter++
+								log.Printf("📤 Queued first IDR frame (complete): %d bytes", len(frameToSend))
+							default:
+								r.frameChan <- frameToSend
+								frameQueueCounter++
+								log.Printf("📤 Queued first IDR frame (complete): %d bytes", len(frameToSend))
+							}
+						}
+						r.currentFrame = r.currentFrame[:0]
+					}
+				}
+
 				// If buffer is large but no frames found, log for debugging
 				if len(buffer) > 100000 && frameQueueCounter == 0 {
 					log.Printf("⚠️ Large buffer (%d bytes) but no NAL units extracted yet - may need more data", len(buffer))
@@ -567,28 +835,90 @@ var (
 )
 
 func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
+	// Check if source is closed first
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+
+	if closed {
+		return nil, fmt.Errorf("RTSP source is closed")
+	}
+
 	// Zero-latency real-time: Try to get frame immediately, very short timeout
 	// If no frame available, wait briefly but don't block long
 	timeout := time.After(100 * time.Millisecond) // Ultra-short timeout for real-time
 
 	select {
-	case frame := <-r.frameChan:
+	case frame, ok := <-r.frameChan:
+		if !ok {
+			// Channel closed - source has failed
+			return nil, fmt.Errorf("frame channel closed - FFmpeg may have failed or exited")
+		}
 		return r.processFrame(frame)
-	case err := <-r.errChan:
+	case err, ok := <-r.errChan:
+		if !ok {
+			// Error channel closed - source has failed
+			return nil, fmt.Errorf("error channel closed - FFmpeg may have failed or exited")
+		}
 		if err != nil {
 			log.Printf("RTSP error: %v", err)
 			return nil, err
 		}
-		return nil, fmt.Errorf("error channel closed")
+		// err is nil but channel is open - this shouldn't happen, but handle it
+		return nil, fmt.Errorf("unexpected nil error from error channel")
 	case <-timeout:
 		// Very short timeout - check if channel has frame now (non-blocking check)
 		select {
-		case frame := <-r.frameChan:
+		case frame, ok := <-r.frameChan:
+			if !ok {
+				// Channel closed while checking
+				return nil, fmt.Errorf("frame channel closed - FFmpeg may have failed or exited")
+			}
 			// Got frame immediately after timeout - process it
 			return r.processFrame(frame)
+		case err, ok := <-r.errChan:
+			if !ok {
+				// Error channel closed
+				return nil, fmt.Errorf("error channel closed - FFmpeg may have failed or exited")
+			}
+			if err != nil {
+				log.Printf("RTSP error: %v", err)
+				return nil, err
+			}
+			// err is nil but channel is open - this shouldn't happen, but handle it
+			return nil, fmt.Errorf("unexpected nil error from error channel")
 		default:
-			// No frame available - retry immediately for continuous real-time streaming
-			return r.ReadFrame()
+			// No frame available and no error - check if channels are closed
+			r.mu.Lock()
+			isClosed := r.closed
+			r.mu.Unlock()
+
+			if isClosed {
+				return nil, fmt.Errorf("RTSP source is closed")
+			}
+
+			// No frame available yet - retry once more with a brief sleep to avoid busy-waiting
+			// but don't recurse infinitely
+			time.Sleep(10 * time.Millisecond)
+			select {
+			case frame, ok := <-r.frameChan:
+				if !ok {
+					return nil, fmt.Errorf("frame channel closed - FFmpeg may have failed or exited")
+				}
+				return r.processFrame(frame)
+			case err, ok := <-r.errChan:
+				if !ok {
+					return nil, fmt.Errorf("error channel closed - FFmpeg may have failed or exited")
+				}
+				if err != nil {
+					return nil, err
+				}
+				// err is nil but channel is open - this shouldn't happen, but handle it
+				return nil, fmt.Errorf("unexpected nil error from error channel")
+			default:
+				// Still no frame - return error instead of infinite recursion
+				return nil, fmt.Errorf("no frame available - FFmpeg may still be initializing or stream may be unavailable")
+			}
 		}
 	}
 }
