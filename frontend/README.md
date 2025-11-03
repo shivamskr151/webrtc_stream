@@ -25,22 +25,29 @@ A modern React + TypeScript frontend application for viewing WebRTC video stream
 ```
 frontend/
 ├── src/
+│   ├── App.tsx                      # Root app component
+│   ├── main.tsx                     # Application entry point
+│   ├── index.css                    # Global styles
 │   ├── components/
-│   │   └── VideoViewer.tsx      # Main video viewer component
+│   │   └── VideoViewer.tsx          # Main video viewer component
 │   ├── hooks/
-│   │   └── useWebRTC.ts         # Custom hook for WebRTC logic
+│   │   └── useWebRTC.ts             # Custom hook for WebRTC logic
 │   ├── config/
-│   │   └── config.ts             # Configuration (signaling URL)
-│   ├── App.tsx                  # Root app component
-│   ├── main.tsx                 # Application entry point
-│   └── index.css                # Global styles
-├── dist/                        # Built production files (generated)
-├── public/                      # Static assets
-├── index.html                   # HTML template
-├── package.json                 # Dependencies and scripts
-├── vite.config.ts               # Vite configuration
-├── tsconfig.json                # TypeScript configuration
-└── tailwind.config.js           # Tailwind CSS configuration
+│   │   └── config.ts                # Signaling URL selection (prod/dev)
+│   └── ice/
+│       └── config.ts                # ICE/STUN/TURN configuration
+├── public/                          # Static assets
+│   └── vite.svg
+├── dist/                            # Built production files (generated)
+├── index.html                       # HTML template
+├── package.json                     # Dependencies and scripts
+├── vite.config.ts                   # Vite configuration
+├── tsconfig.json                    # TypeScript configuration
+├── tsconfig.app.json
+├── tsconfig.node.json
+├── tailwind.config.js               # Tailwind CSS configuration
+├── postcss.config.js
+└── eslint.config.js
 ```
 
 ## Setup
@@ -69,14 +76,14 @@ The frontend will be available at `http://localhost:5173` (or another port if 51
 **Note:** In development mode, you'll need to:
 1. Run the signaling server: `cd ../backend && go run cmd/signaling/main.go`
 2. Run the publisher service: `cd ../backend && go run cmd/publisher/main.go`
-3. Make sure the signaling server WebSocket URL matches your configuration (default: `ws://localhost:8080/ws`)
+3. Make sure the signaling server WebSocket URL matches your configuration (default: `ws://localhost:8081/ws`)
 
 ### Environment Variables
 
 Create a `.env` file in the `frontend` directory (optional for development):
 
 ```env
-VITE_SIGNALING_SERVER_URL=ws://localhost:8080/ws
+VITE_SIGNALING_SERVER_URL=ws://localhost:8081/ws
 VITE_ICE_SERVER_URLS=stun:stun.l.google.com:19302
 ```
 
@@ -108,7 +115,7 @@ The build output includes:
    - Publisher service: `cd ../backend && go run cmd/publisher/main.go`
 
 3. **Open the application**:
-   - Production: `http://localhost:8080` (served by backend)
+   - Production: `http://localhost:8081` (served by backend)
    - Development: `http://localhost:5173` (Vite dev server)
 
 4. **Connect to stream**:

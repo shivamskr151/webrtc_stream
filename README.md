@@ -27,22 +27,56 @@ A complete WebRTC video streaming solution with a Go backend (signaling server +
 webrtc/
 ├── backend/
 │   ├── cmd/
-│   │   ├── signaling/      # Signaling server
-│   │   └── publisher/       # Publisher service
+│   │   ├── publisher/
+│   │   │   └── main.go                # Publisher service entry
+│   │   └── signaling/
+│   │       └── main.go                # Signaling server entry
 │   ├── internal/
-│   │   ├── config/          # Configuration management
-│   │   ├── signaling/      # WebSocket signaling logic
-│   │   └── video/           # Video capture abstraction
+│   │   ├── config/
+│   │   │   └── config.go              # Env/config loader
+│   │   ├── ice/
+│   │   │   └── config.go              # WebRTC ICE config
+│   │   ├── signaling/
+│   │   │   └── server.go              # WebSocket signaling logic
+│   │   └── video/
+│   │       ├── capture.go             # Video capture abstraction
+│   │       └── rtsp.go                # RTSP → samples via FFmpeg
+│   ├── Makefile
 │   ├── go.mod
-│   └── .env                 # Backend environment variables
+│   ├── go.sum
+│   └── .env                           # Backend environment variables
 ├── frontend/
 │   ├── src/
-│   │   ├── components/      # React components
-│   │   ├── hooks/           # Custom React hooks
-│   │   ├── config/          # Frontend configuration
-│   │   └── App.tsx
+│   │   ├── App.tsx
+│   │   ├── main.tsx
+│   │   ├── index.css
+│   │   ├── components/
+│   │   │   └── VideoViewer.tsx        # Viewer UI
+│   │   ├── hooks/
+│   │   │   └── useWebRTC.ts           # WebRTC logic
+│   │   ├── config/
+│   │   │   └── config.ts              # Signaling URL selection
+│   │   └── ice/
+│   │       └── config.ts              # ICE/STUN/TURN config
+│   ├── public/
+│   │   └── vite.svg
+│   ├── dist/                          # Production build output
+│   ├── index.html
 │   ├── package.json
-│   └── .env                 # Frontend environment variables
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tsconfig.app.json
+│   ├── tsconfig.node.json
+│   ├── tailwind.config.js
+│   ├── postcss.config.js
+│   └── eslint.config.js
+├── logs/
+│   ├── publisher.log
+│   └── signaling.log
+├── start.sh
+├── start_background.sh
+├── stop_services.sh
+├── package.json
 └── README.md
 ```
 
@@ -84,16 +118,16 @@ touch .env
 3. Edit `.env` file with your configuration:
 ```env
 SIGNALING_SERVER_HOST=localhost
-SIGNALING_SERVER_PORT=8080
+SIGNALING_SERVER_PORT=8081
 PUBLISHER_SERVER_HOST=localhost
-PUBLISHER_SERVER_PORT=8081
+PUBLISHER_SERVER_PORT=8082
 ICE_SERVER_URLS=stun:stun.l.google.com:19302
 VIDEO_DEVICE_INDEX=0
 VIDEO_WIDTH=1280
 VIDEO_HEIGHT=720
 VIDEO_FPS=30
 RTSP_URL=rtsp://admin:Tatva%40321@183.82.113.87:554/Streaming/Channels/301
-ALLOWED_ORIGINS=http://localhost:8080,http://localhost:5173,http://localhost:3000
+ALLOWED_ORIGINS=http://localhost:8081,http://localhost:8082,http://localhost:5173,http://localhost:3000
 STATIC_FILES_PATH=../frontend/dist
 ```
 
@@ -151,7 +185,7 @@ cd backend
 go run cmd/publisher/main.go
 ```
 
-4. Open your browser and navigate to `http://localhost:8080` (or the port configured in `.env`)
+4. Open your browser and navigate to `http://localhost:8081` (or the port configured in `.env`)
 
 **Option 2: Manual Start (Production Mode - Single Port)**
 
@@ -162,7 +196,7 @@ npm run build
 cd ..
 ```
 
-2. Run the backend server (serves both API and frontend on port 8080):
+2. Run the backend server (serves both API and frontend on port 8081):
 ```bash
 cd backend
 go run cmd/signaling/main.go
@@ -176,12 +210,12 @@ go run cmd/publisher/main.go
 
 4. Open your browser and navigate to:
 ```
-http://localhost:8080
+http://localhost:8081
 ```
 
 The backend server serves both:
-- WebSocket signaling at `ws://localhost:8080/ws`
-- Frontend application at `http://localhost:8080`
+- WebSocket signaling at `ws://localhost:8081/ws`
+- Frontend application at `http://localhost:8081`
 
 **Option 3: Development Mode (Separate Ports)**
 
@@ -213,7 +247,7 @@ npm run dev
 2. **Build the frontend**: `cd frontend && npm run build`
 3. **Start the signaling server**: `cd backend && go run cmd/signaling/main.go`
 4. **Start the publisher service**: In another terminal, run `cd backend && go run cmd/publisher/main.go`
-5. **Open the frontend**: Navigate to `http://localhost:8080` in your browser
+5. **Open the frontend**: Navigate to `http://localhost:8081` in your browser
 6. **Connect**: Click the "Connect" button to establish the WebRTC connection
 7. **Watch**: The video stream should appear in the viewer once the connection is established
 
@@ -240,10 +274,10 @@ All configurations are loaded from `.env` files:
 
 ### Backend Configuration
 
-- **SIGNALING_SERVER_HOST**: Host for the signaling server
-- **SIGNALING_SERVER_PORT**: Port for the signaling server
-- **PUBLISHER_SERVER_HOST**: Host for the publisher service
-- **PUBLISHER_SERVER_PORT**: Port for the publisher service
+- **SIGNALING_SERVER_HOST**: Host for the signaling server (default: localhost)
+- **SIGNALING_SERVER_PORT**: Port for the signaling server (default: 8081)
+- **PUBLISHER_SERVER_HOST**: Host for the publisher service (default: localhost)
+- **PUBLISHER_SERVER_PORT**: Port for the publisher service (default: 8082)
 - **ICE_SERVER_URLS**: Comma-separated list of STUN/TURN server URLs
 - **ICE_SERVER_USERNAME**: Optional username for TURN server
 - **ICE_SERVER_CREDENTIAL**: Optional credential for TURN server
