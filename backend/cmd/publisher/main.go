@@ -161,9 +161,35 @@ func (p *Publisher) createViewerConnection(clientID string) (*ViewerConnection, 
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("📡 [%s] Peer connection state: %s", clientID, state.String())
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			// Clean up when connection closes
+		if state == webrtc.PeerConnectionStateClosed {
+			// Only clean up when connection is explicitly closed
 			p.removeViewer(clientID)
+		} else if state == webrtc.PeerConnectionStateFailed {
+			// For failed state, wait a bit and try to recover
+			go func() {
+				time.Sleep(5 * time.Second)
+				// Check if connection recovered
+				p.viewersMu.RLock()
+				viewer, exists := p.viewers[clientID]
+				p.viewersMu.RUnlock()
+
+				if exists && viewer.pc != nil {
+					currentState := viewer.pc.ConnectionState()
+					currentICE := viewer.pc.ICEConnectionState()
+					if currentState == webrtc.PeerConnectionStateFailed &&
+						(currentICE == webrtc.ICEConnectionStateFailed || currentICE == webrtc.ICEConnectionStateClosed) {
+						log.Printf("🔄 [%s] Connection still failed after 5s, attempting ICE restart...", clientID)
+						// Try to restart ICE by creating a new offer
+						if err := p.restartICEForViewer(clientID); err != nil {
+							log.Printf("❌ [%s] Failed to restart ICE: %v, removing connection", clientID, err)
+							p.removeViewer(clientID)
+						}
+					} else if currentState == webrtc.PeerConnectionStateConnected ||
+						currentState == webrtc.PeerConnectionStateConnecting {
+						log.Printf("✅ [%s] Connection recovered!", clientID)
+					}
+				}
+			}()
 		}
 	})
 
@@ -171,8 +197,56 @@ func (p *Publisher) createViewerConnection(clientID string) (*ViewerConnection, 
 		log.Printf("🧊 [%s] ICE connection state: %s", clientID, state.String())
 		if state == webrtc.ICEConnectionStateConnected {
 			log.Printf("✅ [%s] ICE connected - media flowing!", clientID)
+		} else if state == webrtc.ICEConnectionStateDisconnected {
+			log.Printf("⚠️ [%s] ICE disconnected - will wait for recovery (up to 10s)...", clientID)
+			// Give it time to recover - disconnected state might be temporary
+			go func() {
+				time.Sleep(10 * time.Second)
+				p.viewersMu.RLock()
+				viewer, exists := p.viewers[clientID]
+				p.viewersMu.RUnlock()
+
+				if exists && viewer.pc != nil {
+					iceState := viewer.pc.ICEConnectionState()
+					if iceState == webrtc.ICEConnectionStateDisconnected ||
+						iceState == webrtc.ICEConnectionStateFailed {
+						log.Printf("🔄 [%s] ICE still disconnected after 10s, attempting restart...", clientID)
+						if err := p.restartICEForViewer(clientID); err != nil {
+							log.Printf("❌ [%s] Failed to restart ICE: %v", clientID, err)
+						}
+					} else if iceState == webrtc.ICEConnectionStateConnected {
+						log.Printf("✅ [%s] ICE connection recovered!", clientID)
+					}
+				}
+			}()
 		} else if state == webrtc.ICEConnectionStateFailed {
-			log.Printf("❌ [%s] ICE connection failed", clientID)
+			log.Printf("❌ [%s] ICE connection failed - will attempt recovery...", clientID)
+			// Don't immediately remove - try to restart ICE first
+			go func() {
+				time.Sleep(2 * time.Second)
+				p.viewersMu.RLock()
+				viewer, exists := p.viewers[clientID]
+				p.viewersMu.RUnlock()
+
+				if exists && viewer.pc != nil {
+					iceState := viewer.pc.ICEConnectionState()
+					if iceState == webrtc.ICEConnectionStateFailed {
+						log.Printf("🔄 [%s] Attempting ICE restart after failure...", clientID)
+						if err := p.restartICEForViewer(clientID); err != nil {
+							log.Printf("❌ [%s] Failed to restart ICE: %v, will remove connection", clientID, err)
+							// Only remove if restart fails
+							time.Sleep(3 * time.Second)
+							p.viewersMu.RLock()
+							viewer, stillExists := p.viewers[clientID]
+							p.viewersMu.RUnlock()
+							if stillExists && viewer.pc != nil &&
+								viewer.pc.ICEConnectionState() == webrtc.ICEConnectionStateFailed {
+								p.removeViewer(clientID)
+							}
+						}
+					}
+				}
+			}()
 		}
 	})
 
@@ -230,6 +304,45 @@ func (p *Publisher) Connect() error {
 	return nil
 }
 
+// restartICEForViewer attempts to restart ICE by creating a new offer
+func (p *Publisher) restartICEForViewer(clientID string) error {
+	p.viewersMu.RLock()
+	viewer, exists := p.viewers[clientID]
+	p.viewersMu.RUnlock()
+
+	if !exists || viewer.pc == nil {
+		return fmt.Errorf("viewer connection not found: %s", clientID)
+	}
+
+	// Create a new offer to restart ICE
+	log.Printf("🔄 [%s] Creating new offer to restart ICE...", clientID)
+	offer, err := viewer.pc.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create restart offer: %w", err)
+	}
+
+	// Set local description with ICE restart flag
+	if err := viewer.pc.SetLocalDescription(offer); err != nil {
+		return fmt.Errorf("failed to set local description for restart: %w", err)
+	}
+
+	// Send the offer to restart ICE negotiation
+	offerMsg := map[string]interface{}{
+		"type":     "offer",
+		"clientId": clientID,
+		"offer": map[string]interface{}{
+			"type": offer.Type.String(),
+			"sdp":  offer.SDP,
+		},
+	}
+	if err := p.sendMessage(offerMsg); err != nil {
+		return fmt.Errorf("failed to send restart offer: %w", err)
+	}
+
+	log.Printf("✅ [%s] Restart offer sent successfully", clientID)
+	return nil
+}
+
 func (p *Publisher) sendOffer(clientID string) error {
 	p.viewersMu.RLock()
 	viewer, exists := p.viewers[clientID]
@@ -279,11 +392,27 @@ func (p *Publisher) readMessages() {
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// Set longer read deadline to handle ping intervals (server pings every 54s)
+	readDeadline := 90 * time.Second
+	conn.SetReadDeadline(time.Now().Add(readDeadline))
 	conn.SetPongHandler(func(string) error {
 		p.wsConnMu.RLock()
 		if p.wsConn != nil {
-			p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			p.wsConn.SetReadDeadline(time.Now().Add(readDeadline))
+		}
+		p.wsConnMu.RUnlock()
+		return nil
+	})
+
+	// Set ping handler to send pong response
+	conn.SetPingHandler(func(message string) error {
+		p.wsConnMu.RLock()
+		if p.wsConn != nil {
+			p.wsConn.SetReadDeadline(time.Now().Add(readDeadline))
+			// Send pong in response to ping
+			if err := p.wsConn.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(10*time.Second)); err != nil {
+				log.Printf("⚠️ Error sending pong: %v", err)
+			}
 		}
 		p.wsConnMu.RUnlock()
 		return nil
@@ -317,7 +446,7 @@ func (p *Publisher) readMessages() {
 		// Reset read deadline on successful read
 		p.wsConnMu.RLock()
 		if p.wsConn != nil {
-			p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			p.wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		}
 		p.wsConnMu.RUnlock()
 
