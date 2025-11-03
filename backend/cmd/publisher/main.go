@@ -17,6 +17,14 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 type ViewerConnection struct {
 	clientID string
 	pc       *webrtc.PeerConnection
@@ -26,11 +34,14 @@ type Publisher struct {
 	viewers      map[string]*ViewerConnection // Track connections by client ID
 	viewersMu    sync.RWMutex                 // Mutex for concurrent access to viewers map
 	wsConn       *websocket.Conn
+	wsConnMu     sync.RWMutex // Mutex for WebSocket connection
 	signalingURL string
 	track        *webrtc.TrackLocalStaticSample
 	capturer     *video.VideoCapturer
 	api          *webrtc.API
 	webrtcConfig webrtc.Configuration
+	shouldStop   bool       // Flag to stop reconnection attempts
+	stopMu       sync.Mutex // Mutex for shouldStop flag
 }
 
 func NewPublisher() (*Publisher, error) {
@@ -221,13 +232,25 @@ func (p *Publisher) removeViewer(clientID string) {
 }
 
 func (p *Publisher) Connect() error {
+	// Close existing connection if any
+	p.wsConnMu.Lock()
+	if p.wsConn != nil {
+		p.wsConn.Close()
+		p.wsConn = nil
+	}
+	p.wsConnMu.Unlock()
+
 	log.Println("Connecting to signaling server...")
 	// Connect to signaling server
 	conn, _, err := websocket.DefaultDialer.Dial(p.signalingURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to signaling server: %w", err)
 	}
+
+	p.wsConnMu.Lock()
 	p.wsConn = conn
+	p.wsConnMu.Unlock()
+
 	log.Println("Connected to signaling server")
 
 	// Start reading messages
@@ -281,14 +304,36 @@ func (p *Publisher) sendOffer(clientID string) error {
 
 func (p *Publisher) readMessages() {
 	// Set read deadline and pong handler
-	p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	p.wsConn.SetPongHandler(func(string) error {
-		p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	p.wsConnMu.RLock()
+	conn := p.wsConn
+	p.wsConnMu.RUnlock()
+
+	if conn == nil {
+		log.Printf("❌ WebSocket connection is nil, cannot read messages")
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		p.wsConnMu.RLock()
+		if p.wsConn != nil {
+			p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		}
+		p.wsConnMu.RUnlock()
 		return nil
 	})
 
 	for {
-		_, message, err := p.wsConn.ReadMessage()
+		p.wsConnMu.RLock()
+		conn = p.wsConn
+		p.wsConnMu.RUnlock()
+
+		if conn == nil {
+			log.Printf("❌ WebSocket connection lost, will attempt reconnection")
+			break
+		}
+
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			// Check if it's a close error
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
@@ -296,11 +341,19 @@ func (p *Publisher) readMessages() {
 			} else {
 				log.Printf("WebSocket closed: %v", err)
 			}
-			return
+			// Mark connection as lost
+			p.wsConnMu.Lock()
+			p.wsConn = nil
+			p.wsConnMu.Unlock()
+			break
 		}
 
 		// Reset read deadline on successful read
-		p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		p.wsConnMu.RLock()
+		if p.wsConn != nil {
+			p.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		}
+		p.wsConnMu.RUnlock()
 
 		var msg map[string]interface{}
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -308,7 +361,10 @@ func (p *Publisher) readMessages() {
 			continue
 		}
 
-		switch msg["type"] {
+		msgType, _ := msg["type"].(string)
+		log.Printf("📥 Received message type: %s (full message keys: %v)", msgType, getKeys(msg))
+
+		switch msgType {
 		case "viewer_connected":
 			// Extract client ID from message
 			clientID, ok := msg["clientId"].(string)
@@ -318,6 +374,17 @@ func (p *Publisher) readMessages() {
 			}
 
 			log.Printf("New viewer connected: %s, creating peer connection...", clientID)
+
+			// Check if a connection already exists for this client ID and clean it up
+			p.viewersMu.Lock()
+			if existingViewer, exists := p.viewers[clientID]; exists {
+				log.Printf("⚠️ Viewer %s already exists, cleaning up old connection first", clientID)
+				if existingViewer.pc != nil {
+					existingViewer.pc.Close()
+				}
+				delete(p.viewers, clientID)
+			}
+			p.viewersMu.Unlock()
 
 			// Create new peer connection for this viewer
 			viewerConn, err := p.createViewerConnection(clientID)
@@ -341,11 +408,21 @@ func (p *Publisher) readMessages() {
 			}
 
 		case "answer":
+			log.Printf("📥 Received answer message, checking clientId...")
 			// Get client ID to route to correct peer connection
+			// Try both clientId and fromClientId (signaling server might add fromClientId)
 			clientID, ok := msg["clientId"].(string)
 			if !ok {
-				log.Printf("⚠️ Answer message missing clientId, cannot route")
-				continue
+				// Try fromClientId as fallback
+				if fromClientID, ok2 := msg["fromClientId"].(string); ok2 {
+					clientID = fromClientID
+					ok = true
+					log.Printf("⚠️ Answer message missing clientId, using fromClientId: %s", clientID)
+				} else {
+					log.Printf("⚠️ Answer message missing both clientId and fromClientId, cannot route")
+					log.Printf("   Message keys: %v", getKeys(msg))
+					continue
+				}
 			}
 
 			p.viewersMu.RLock()
@@ -443,21 +520,53 @@ func (p *Publisher) readMessages() {
 			}
 		}
 	}
+
+	// After loop exits, try to reconnect if not stopped
+	p.stopMu.Lock()
+	shouldReconnect := !p.shouldStop
+	p.stopMu.Unlock()
+
+	if shouldReconnect {
+		log.Printf("🔄 Attempting to reconnect to signaling server in 2 seconds...")
+		time.Sleep(2 * time.Second)
+		if err := p.Connect(); err != nil {
+			log.Printf("❌ Reconnection failed: %v, will retry in 5 seconds...", err)
+			time.Sleep(5 * time.Second)
+			// Retry once more, then let it fail silently (could add exponential backoff)
+			if err := p.Connect(); err != nil {
+				log.Printf("❌ Reconnection failed again: %v", err)
+			}
+		} else {
+			log.Printf("✅ Successfully reconnected to signaling server")
+		}
+	}
 }
 
 func (p *Publisher) sendMessage(msg map[string]interface{}) error {
+	p.wsConnMu.RLock()
+	conn := p.wsConn
+	p.wsConnMu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("WebSocket connection is nil")
+	}
+
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
 	// Set write deadline
-	p.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return p.wsConn.WriteMessage(websocket.TextMessage, data)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (p *Publisher) sendICECandidate(candidate *webrtc.ICECandidate, clientID string) {
-	if p.wsConn == nil {
+	p.wsConnMu.RLock()
+	conn := p.wsConn
+	p.wsConnMu.RUnlock()
+
+	if conn == nil {
 		log.Printf("⚠️ Cannot send ICE candidate - WebSocket not connected")
 		return
 	}
@@ -686,6 +795,11 @@ func (p *Publisher) StartStreaming() error {
 }
 
 func (p *Publisher) Close() {
+	// Set stop flag to prevent reconnection
+	p.stopMu.Lock()
+	p.shouldStop = true
+	p.stopMu.Unlock()
+
 	if p.capturer != nil {
 		p.capturer.Close()
 	}
@@ -701,11 +815,14 @@ func (p *Publisher) Close() {
 	p.viewers = make(map[string]*ViewerConnection)
 	p.viewersMu.Unlock()
 
+	p.wsConnMu.Lock()
 	if p.wsConn != nil {
 		// Send proper close message before closing
 		p.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		p.wsConn.Close()
+		p.wsConn = nil
 	}
+	p.wsConnMu.Unlock()
 }
 
 func main() {

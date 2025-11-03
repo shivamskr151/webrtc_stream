@@ -95,28 +95,41 @@ func (s *SignalingServer) Run() {
 			hasExistingClients := len(s.clients) > 0
 			s.clients[client] = true
 			clientCount := len(s.clients)
+			existingClientIDs := make([]string, 0, len(s.clients))
+			for c := range s.clients {
+				existingClientIDs = append(existingClientIDs, c.clientID)
+			}
 			s.mu.Unlock()
-			log.Printf("Client connected: %s (total clients: %d)", client.clientID, clientCount)
+			log.Printf("Client connected: %s (total clients: %d, existing: %v)", client.clientID, clientCount, existingClientIDs)
 
-			// If there were existing clients (likely a publisher), notify them about the new viewer
+			// Notify existing clients (likely publisher) about the new viewer
 			if hasExistingClients {
 				notifyMsg := map[string]interface{}{
 					"type":     "viewer_connected",
 					"clientId": client.clientID,
 				}
 				notifyBytes, _ := json.Marshal(notifyMsg)
+				log.Printf("Broadcasting viewer_connected message for %s to %d existing client(s)", client.clientID, len(s.clients)-1)
 				s.mu.RLock()
+				notifiedCount := 0
 				for otherClient := range s.clients {
 					if otherClient != client {
 						select {
 						case otherClient.send <- notifyBytes:
-							log.Printf("Notified client %s about new viewer %s", otherClient.clientID, client.clientID)
+							log.Printf("✅ Notified client %s about new viewer %s", otherClient.clientID, client.clientID)
+							notifiedCount++
 						default:
-							log.Printf("Warning: Could not notify client %s (channel full)", otherClient.clientID)
+							log.Printf("⚠️ Warning: Could not notify client %s (channel full), closing connection", otherClient.clientID)
+							// Channel is full, client might be stuck - close it to force cleanup
+							close(otherClient.send)
+							delete(s.clients, otherClient)
 						}
 					}
 				}
 				s.mu.RUnlock()
+				log.Printf("Sent viewer_connected notification to %d client(s)", notifiedCount)
+			} else {
+				log.Printf("No existing clients, new client %s will wait for publisher/viewer to connect", client.clientID)
 			}
 
 		case client := <-s.unregister:
@@ -141,13 +154,20 @@ func (s *SignalingServer) HandleWebSocket(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	clientID := fmt.Sprintf("client-%d", len(s.clients)+1)
+	// Get client count atomically to ensure unique IDs
+	s.mu.Lock()
+	clientCount := len(s.clients)
+	clientID := fmt.Sprintf("client-%d", clientCount+1)
+	s.mu.Unlock()
+	
 	client := &Client{
 		conn:     conn,
 		server:   s,
 		send:     make(chan []byte, 256),
 		clientID: clientID,
 	}
+
+	log.Printf("Creating new client: %s (before registration, total clients: %d)", clientID, clientCount)
 
 	// Register client (notification will be sent in Run() goroutine after registration)
 	client.server.register <- client
@@ -158,9 +178,10 @@ func (s *SignalingServer) HandleWebSocket(w http.ResponseWriter, r *http.Request
 
 func (c *Client) readPump() {
 	defer func() {
+		// Unregister client - this will close the send channel, which will cause writePump to exit
 		c.server.unregister <- c
-		// Use proper close code
-		c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		// Don't write directly here - writePump handles all writes
+		// Just close the connection (this is safe to do from readPump)
 		c.conn.Close()
 	}()
 
@@ -177,6 +198,7 @@ func (c *Client) readPump() {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
 				log.Printf("WebSocket read error: %v", err)
 			}
+			// Break out of loop on any read error - the defer will handle cleanup
 			break
 		}
 
@@ -226,8 +248,14 @@ func (c *Client) readPump() {
 
 func (c *Client) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
+	closeSent := false
 	defer func() {
 		ticker.Stop()
+		// Send close message before closing connection (only if not already sent)
+		if !closeSent {
+			c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		}
+		// Close connection
 		c.conn.Close()
 	}()
 
@@ -236,7 +264,8 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
-				// Channel closed, send close message
+				// Channel closed by unregister - send close message and exit
+				closeSent = true
 				c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 				return
 			}

@@ -1,6 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import config from '../config/config';
 
+interface CandidateMessage {
+  type: 'candidate';
+  candidate: RTCIceCandidateInit;
+  clientId?: string;
+}
+
+interface AnswerMessage {
+  type: 'answer';
+  answer: RTCSessionDescriptionInit;
+  clientId?: string;
+}
+
 export const useWebRTC = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionState, setConnectionState] = useState<RTCIceConnectionState>('new');
@@ -12,6 +24,8 @@ export const useWebRTC = () => {
   const remoteDescriptionSetRef = useRef(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const clientIdRef = useRef<string | null>(null); // Track our client ID
+  const isConnectingRef = useRef(false); // Prevent concurrent connections
+  const isDisconnectingRef = useRef(false); // Prevent race conditions during disconnect
 
   const createPeerConnection = () => {
     // Get ICE servers from environment or use defaults
@@ -41,7 +55,7 @@ export const useWebRTC = () => {
         });
         
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          const candidateMsg: any = {
+          const candidateMsg: CandidateMessage = {
             type: 'candidate',
             candidate: event.candidate,
           };
@@ -117,7 +131,13 @@ export const useWebRTC = () => {
     };
 
     // Handle incoming tracks
-    pc.ontrack = (event) => {
+    pc.ontrack = async (event) => {
+      // Ensure this is the current peer connection
+      if (pc !== peerConnectionRef.current) {
+        console.warn('⚠️ Received track from stale peer connection, ignoring');
+        return;
+      }
+
       console.log('✅ Received track event:', {
         kind: event.track.kind,
         label: event.track.label,
@@ -135,24 +155,24 @@ export const useWebRTC = () => {
       // Ensure track is enabled
       event.track.enabled = true;
       
-      // Create or get existing stream
-      if (!mediaStreamRef.current) {
-        mediaStreamRef.current = new MediaStream();
-        console.log('🎥 Created new MediaStream');
+      // Always create a fresh stream to avoid stale tracks from previous connections
+      // Remove old stream tracks if they exist
+      if (mediaStreamRef.current) {
+        const oldTracks = mediaStreamRef.current.getTracks();
+        oldTracks.forEach(track => {
+          track.stop();
+          mediaStreamRef.current!.removeTrack(track);
+        });
       }
       
-      // Add track to stream (avoid duplicates)
-      const existingTrack = mediaStreamRef.current.getTracks().find(t => t.id === event.track.id);
-      if (!existingTrack) {
-        mediaStreamRef.current.addTrack(event.track);
-        console.log('✅ Added track to stream:', {
-          kind: event.track.kind,
-          id: event.track.id,
-          enabled: event.track.enabled
-        });
-      } else {
-        console.log('⚠️ Track already in stream:', event.track.id);
-      }
+      // Create new MediaStream
+      mediaStreamRef.current = new MediaStream();
+      mediaStreamRef.current.addTrack(event.track);
+      console.log('🎥 Created new MediaStream with track:', {
+        kind: event.track.kind,
+        id: event.track.id,
+        enabled: event.track.enabled
+      });
       
       // Only set hasTrack for video tracks
       if (event.track.kind === 'video') {
@@ -167,26 +187,27 @@ export const useWebRTC = () => {
       
       // Set video source with the accumulated stream
       const stream = mediaStreamRef.current;
-      videoRef.current.srcObject = stream;
-      videoRef.current.muted = true; // Required for autoplay
-      videoRef.current.playsInline = true; // For mobile
       
-      console.log('✅ Video srcObject set, stream:', {
-        id: stream.id,
-        active: stream.active,
-        tracks: stream.getTracks().map(t => ({
-          kind: t.kind,
-          enabled: t.enabled,
-          readyState: t.readyState,
-          id: t.id
-        }))
-      });
+      // Verify stream is valid and has active tracks
+      if (!stream || stream.getTracks().length === 0) {
+        console.error('❌ Stream is invalid or has no tracks');
+        return;
+      }
       
-      // Force video to load and play
+      const activeTracks = stream.getTracks().filter(t => t.readyState === 'live');
+      
+      // Define attemptPlay function early so it can be used in event listeners
       const attemptPlay = async () => {
         if (!videoRef.current || !videoRef.current.srcObject) {
           console.warn('⚠️ Video element or srcObject missing during play attempt');
           return;
+        }
+        
+        // Ensure the video element is ready
+        if (videoRef.current.readyState === 0) {
+          // HAVE_NOTHING - need to load first
+          console.log('⏳ Video element needs to load, calling load()...');
+          videoRef.current.load();
         }
         
         try {
@@ -205,28 +226,30 @@ export const useWebRTC = () => {
               srcObject: videoRef.current.srcObject ? 'set' : 'not set'
             });
           } else {
-            // Wait for metadata
+            // Wait for metadata with timeout
             console.log('⏳ Waiting for video metadata (readyState:', videoRef.current.readyState, ')');
-            videoRef.current.addEventListener('loadedmetadata', async () => {
+            
+            let metadataResolved = false;
+            const playAfterMetadata = async () => {
+              if (metadataResolved) return;
+              metadataResolved = true;
               console.log('✅ Metadata loaded, attempting play');
               try {
-                await videoRef.current!.play();
-                console.log('✅ Video playback started after metadata loaded!');
+                if (videoRef.current && videoRef.current.srcObject === stream) {
+                  await videoRef.current.play();
+                  console.log('✅ Video playback started after metadata loaded!');
+                }
               } catch (err) {
                 console.error('❌ Error playing after metadata:', err);
               }
-            }, { once: true });
+            };
             
-            // Also try on canplay
-            videoRef.current.addEventListener('canplay', async () => {
-              console.log('✅ Can play event, attempting play');
-              try {
-                await videoRef.current!.play();
-                console.log('✅ Video playback started after canplay!');
-              } catch (err) {
-                console.error('❌ Error playing after canplay:', err);
-              }
-            }, { once: true });
+            videoRef.current.addEventListener('loadedmetadata', playAfterMetadata, { once: true });
+            videoRef.current.addEventListener('canplay', playAfterMetadata, { once: true });
+            videoRef.current.addEventListener('loadeddata', playAfterMetadata, { once: true });
+            
+            // Fallback: try to play anyway after a short delay
+            setTimeout(playAfterMetadata, 500);
           }
         } catch (err) {
           console.error('❌ Error playing video:', err);
@@ -238,10 +261,60 @@ export const useWebRTC = () => {
         }
       };
       
-      // Try immediately
-      attemptPlay();
+      if (activeTracks.length === 0) {
+        console.warn('⚠️ Stream has no live tracks yet, will wait for track to become live');
+        // Set up listener for when track becomes live
+        event.track.addEventListener('started', () => {
+          if (videoRef.current && mediaStreamRef.current === stream && pc === peerConnectionRef.current) {
+            console.log('✅ Track became live, updating video element');
+            videoRef.current.srcObject = stream;
+            attemptPlay();
+          }
+        }, { once: true });
+        return;
+      }
       
-      // Also try after delays to handle async stream setup
+      // CRITICAL: Clear old srcObject first to ensure proper update
+      // This is especially important after reconnection
+      if (videoRef.current.srcObject) {
+        console.log('🧹 Clearing old srcObject before setting new stream');
+        const oldStream = videoRef.current.srcObject;
+        videoRef.current.srcObject = null;
+        // Force a small delay to ensure the old stream is fully cleared
+        await new Promise(resolve => setTimeout(resolve, 50));
+        // Clean up old stream tracks
+        if (oldStream instanceof MediaStream) {
+          oldStream.getTracks().forEach(track => {
+            if (track.readyState !== 'ended') {
+              track.stop();
+            }
+          });
+        }
+      }
+      
+      // Set new stream
+      console.log('🎬 Setting new stream on video element:', {
+        streamId: stream.id,
+        trackCount: stream.getTracks().length,
+        activeTrackCount: activeTracks.length
+      });
+      videoRef.current.srcObject = stream;
+      videoRef.current.muted = true; // Required for autoplay
+      videoRef.current.playsInline = true; // For mobile
+      
+      console.log('✅ Video srcObject set, stream:', {
+        id: stream.id,
+        active: stream.active,
+        tracks: stream.getTracks().map(t => ({
+          kind: t.kind,
+          enabled: t.enabled,
+          readyState: t.readyState,
+          id: t.id
+        }))
+      });
+      
+      // Try immediately, then with delays (attemptPlay is already defined above)
+      attemptPlay();
       setTimeout(attemptPlay, 100);
       setTimeout(attemptPlay, 500);
       setTimeout(attemptPlay, 1000);
@@ -292,8 +365,51 @@ export const useWebRTC = () => {
   };
 
   const connect = async () => {
+    // Prevent concurrent connections
+    if (isConnectingRef.current || isDisconnectingRef.current) {
+      console.log('⚠️ Connection already in progress or disconnecting, skipping...');
+      return;
+    }
+
+    // If already connected, disconnect first
+    if (peerConnectionRef.current || wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('⚠️ Already connected, disconnecting first...');
+      disconnect();
+      // Wait a bit for cleanup
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    isConnectingRef.current = true;
+
     try {
-      console.log('Attempting to connect to:', config.signalingServerUrl);
+      console.log('🔌 Attempting to connect to:', config.signalingServerUrl);
+      
+      // Reset state before connecting
+      setIsConnected(false);
+      setConnectionState('new');
+      setHasTrack(false);
+      clientIdRef.current = null;
+      remoteDescriptionSetRef.current = false;
+      candidateQueueRef.current = [];
+      
+      // Ensure old references are cleared
+      if (peerConnectionRef.current) {
+        try {
+          peerConnectionRef.current.close();
+        } catch (err) {
+          console.warn('Error closing old peer connection:', err);
+        }
+        peerConnectionRef.current = null;
+      }
+      
+      if (mediaStreamRef.current) {
+        try {
+          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+        } catch (err) {
+          console.warn('Error stopping old tracks:', err);
+        }
+        mediaStreamRef.current = null;
+      }
       
       // Connect to signaling server
       const ws = new WebSocket(config.signalingServerUrl);
@@ -302,10 +418,12 @@ export const useWebRTC = () => {
       ws.onopen = () => {
         setIsConnected(true);
         setConnectionState('checking');
+        isConnectingRef.current = false;
         console.log('✅ Connected to signaling server');
       };
 
       ws.onclose = (event) => {
+        isConnectingRef.current = false;
         setIsConnected(false);
         setConnectionState('disconnected');
         console.log('❌ Disconnected from signaling server', {
@@ -316,6 +434,7 @@ export const useWebRTC = () => {
       };
 
       ws.onerror = (error) => {
+        isConnectingRef.current = false;
         console.error('❌ WebSocket connection error:', error);
         console.error('Failed to connect to:', config.signalingServerUrl);
         console.error('Make sure the signaling server is running on port 8081');
@@ -381,7 +500,7 @@ export const useWebRTC = () => {
                 console.log('✅ Local description set');
                 
                 console.log('Sending answer to publisher...');
-                const answerMsg: any = {
+                const answerMsg: AnswerMessage = {
                   type: 'answer',
                   answer: answer,
                 };
@@ -454,6 +573,7 @@ export const useWebRTC = () => {
       candidateQueueRef.current = [];
       console.log('Peer connection created, waiting for offer...');
     } catch (error) {
+      isConnectingRef.current = false;
       console.error('Error connecting:', error);
       setIsConnected(false);
       setConnectionState('failed');
@@ -461,29 +581,87 @@ export const useWebRTC = () => {
   };
 
   const disconnect = () => {
+    // Prevent concurrent disconnect calls
+    if (isDisconnectingRef.current) {
+      return;
+    }
+    isDisconnectingRef.current = true;
+    isConnectingRef.current = false;
+
+    console.log('🔌 Disconnecting...');
+
+    // Close and clean up peer connection
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
+      try {
+        peerConnectionRef.current.close();
+      } catch (err) {
+        console.error('Error closing peer connection:', err);
+      }
       peerConnectionRef.current = null;
     }
+
+    // Close and clean up WebSocket
     if (wsRef.current) {
-      // Close WebSocket properly with close code
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.close(1000, 'Normal closure');
-      } else {
-        wsRef.current.close();
+      try {
+        // Remove all event listeners by replacing with no-op handlers
+        wsRef.current.onopen = null;
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onmessage = null;
+        
+        // Close WebSocket properly with close code
+        if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+          wsRef.current.close(1000, 'Normal closure');
+        } else {
+          wsRef.current.close();
+        }
+      } catch (err) {
+        console.error('Error closing WebSocket:', err);
       }
       wsRef.current = null;
     }
+
+    // Clean up video element
     if (videoRef.current) {
-      videoRef.current.srcObject = null;
+      try {
+        videoRef.current.pause();
+        // Clear srcObject but don't call load() - it can interfere with future streams
+        // The load() will be called when we set a new stream if needed
+        videoRef.current.srcObject = null;
+      } catch (err) {
+        console.error('Error cleaning up video element:', err);
+      }
     }
+
+    // Clean up media stream and tracks
     if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      try {
+        mediaStreamRef.current.getTracks().forEach(track => {
+          track.stop();
+          track.enabled = false;
+        });
+      } catch (err) {
+        console.error('Error stopping tracks:', err);
+      }
       mediaStreamRef.current = null;
     }
+
+    // Reset all state
     setIsConnected(false);
     setConnectionState('closed');
     setHasTrack(false);
+    
+    // Reset all refs
+    clientIdRef.current = null;
+    remoteDescriptionSetRef.current = false;
+    candidateQueueRef.current = [];
+
+    console.log('✅ Disconnected and cleaned up');
+    
+    // Reset disconnecting flag after a short delay to allow cleanup to complete
+    setTimeout(() => {
+      isDisconnectingRef.current = false;
+    }, 100);
   };
 
   useEffect(() => {
