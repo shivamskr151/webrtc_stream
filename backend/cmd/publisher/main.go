@@ -470,10 +470,19 @@ func (p *Publisher) readMessages() {
 
 		case "candidate":
 			// Get client ID to route to correct peer connection
+			// Try both clientId and fromClientId (signaling server adds fromClientId)
 			clientID, ok := msg["clientId"].(string)
 			if !ok {
-				log.Printf("⚠️ Candidate message missing clientId, cannot route")
-				continue
+				// Try fromClientId as fallback
+				if fromClientID, ok2 := msg["fromClientId"].(string); ok2 {
+					clientID = fromClientID
+					ok = true
+					log.Printf("⚠️ Candidate message missing clientId, using fromClientId: %s", clientID)
+				} else {
+					log.Printf("⚠️ Candidate message missing both clientId and fromClientId, cannot route")
+					log.Printf("   Message keys: %v", getKeys(msg))
+					continue
+				}
 			}
 
 			p.viewersMu.RLock()
@@ -482,6 +491,13 @@ func (p *Publisher) readMessages() {
 
 			if !exists {
 				log.Printf("⚠️ Received candidate from unknown viewer: %s", clientID)
+				p.viewersMu.RLock()
+				ids := make([]string, 0, len(p.viewers))
+				for id := range p.viewers {
+					ids = append(ids, id)
+				}
+				p.viewersMu.RUnlock()
+				log.Printf("   Available viewers: %v", ids)
 				continue
 			}
 

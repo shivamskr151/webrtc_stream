@@ -55,16 +55,25 @@ export const useWebRTC = () => {
         });
         
         if (wsRef.current?.readyState === WebSocket.OPEN) {
+          // Always send candidate - signaling server will add clientId if missing
+          // But include it if we know it to help with routing
           const candidateMsg: CandidateMessage = {
             type: 'candidate',
-            candidate: event.candidate,
+            candidate: {
+              candidate: event.candidate.candidate,
+              sdpMLineIndex: event.candidate.sdpMLineIndex ?? undefined,
+              sdpMid: event.candidate.sdpMid ?? undefined,
+            },
           };
-          // Include our client ID if we know it
+          // Include our client ID if we know it (helps with routing)
           if (clientIdRef.current) {
             candidateMsg.clientId = clientIdRef.current;
+            console.log('📤 Sending ICE candidate with clientId:', clientIdRef.current);
+          } else {
+            console.log('📤 Sending ICE candidate (clientId will be set by signaling server)');
           }
           wsRef.current.send(JSON.stringify(candidateMsg));
-          console.log('📤 Sent ICE candidate to publisher');
+          console.log('✅ ICE candidate sent');
         } else {
           console.warn('⚠️ WebSocket not open, cannot send candidate');
         }
@@ -449,14 +458,42 @@ export const useWebRTC = () => {
           answer?: RTCSessionDescriptionInit;
           candidate?: RTCIceCandidateInit | { candidate?: string; sdpMLineIndex?: number; sdpMid?: string };
           clientId?: string;
+          fromClientId?: string;
         }
         const message = JSON.parse(event.data) as WebRTCMessage;
         console.log('📥 Received message:', message.type, message);
 
         // Track our client ID from any message (signaling server adds it)
-        if (message.clientId && !clientIdRef.current) {
-          clientIdRef.current = message.clientId;
-          console.log('✅ Identified client ID:', message.clientId);
+        // Try both clientId (if message is for us) and fromClientId (sender's ID)
+        if (!clientIdRef.current) {
+          // If this message has clientId and it matches what we might expect, use it
+          // Otherwise, use fromClientId if this message is from the signaling server
+          if (message.fromClientId) {
+            // If we receive a message with fromClientId, we can infer our ID
+            // But actually, we should wait for a message that explicitly identifies us
+            // The signaling server sets clientId to the sender's ID if not present
+            // So if we see fromClientId != clientId, clientId is the target (us)
+            if (message.clientId && message.fromClientId !== message.clientId) {
+              clientIdRef.current = message.clientId;
+              console.log('✅ Identified client ID from routing:', message.clientId);
+            }
+          }
+          // Also check if message.clientId exists - signaling server may set it to our ID
+          if (message.clientId && !message.fromClientId) {
+            // Message doesn't have fromClientId, so clientId might be ours
+            clientIdRef.current = message.clientId;
+            console.log('✅ Identified client ID (no fromClientId):', message.clientId);
+          }
+        }
+        
+        // Additional check: if we see fromClientId and it's different from clientId, 
+        // and clientId matches what we might expect, use clientId
+        if (!clientIdRef.current && message.clientId && message.fromClientId) {
+          // In offer messages, clientId is the target (viewer), fromClientId is sender (publisher)
+          if (message.type === 'offer' && message.clientId) {
+            clientIdRef.current = message.clientId;
+            console.log('✅ Identified client ID from offer message:', message.clientId);
+          }
         }
 
         // Ensure peer connection exists
