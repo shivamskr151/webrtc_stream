@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import config from '../config/config';
+import { getWebRTCConfiguration } from '../ice/config';
 
 interface CandidateMessage {
   type: 'candidate';
@@ -28,22 +29,10 @@ export const useWebRTC = () => {
   const isDisconnectingRef = useRef(false); // Prevent race conditions during disconnect
 
   const createPeerConnection = () => {
-    // Get ICE servers from environment or use defaults
-    const iceServerUrls = import.meta.env.VITE_ICE_SERVER_URLS?.split(',') || ['stun:stun.l.google.com:19302'];
+    // Get centralized WebRTC configuration (ICE/STUN/TURN)
+    const webrtcConfig = getWebRTCConfiguration();
     
-    // Build ICE servers array - add multiple STUN servers for redundancy
-    const iceServers: RTCConfiguration = {
-      iceServers: [
-        ...iceServerUrls.map((url: string) => ({ urls: url.trim() })),
-        // Add backup STUN servers
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-      ],
-      iceTransportPolicy: 'all', // Allow all transport types (UDP, TCP)
-    };
-
-    console.log('🔧 Creating PeerConnection with ICE servers:', iceServers.iceServers);
-    const pc = new RTCPeerConnection(iceServers);
+    const pc = new RTCPeerConnection(webrtcConfig);
 
     // Handle ICE candidate events
     pc.onicecandidate = (event) => {

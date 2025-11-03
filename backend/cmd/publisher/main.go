@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"webrtc-streaming/internal/config"
+	iceutils "webrtc-streaming/internal/ice"
 	"webrtc-streaming/internal/video"
 
 	"github.com/gorilla/websocket"
@@ -45,43 +46,8 @@ type Publisher struct {
 }
 
 func NewPublisher() (*Publisher, error) {
-	// Create WebRTC configuration with improved ICE settings
-	webrtcConfig := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{},
-		// Allow all ICE transport types (UDP, TCP, relay)
-		ICETransportPolicy: webrtc.ICETransportPolicyAll,
-		// Enable ICE candidate gathering for all types
-		ICECandidatePoolSize: 0, // Let Pion manage this
-	}
-
-	// Add ICE servers from config
-	for _, iceURL := range config.AppConfig.WebRTC.ICEServerURLs {
-		iceServer := webrtc.ICEServer{
-			URLs: []string{iceURL},
-		}
-		if config.AppConfig.WebRTC.ICEServerUsername != "" {
-			iceServer.Username = config.AppConfig.WebRTC.ICEServerUsername
-			iceServer.Credential = config.AppConfig.WebRTC.ICEServerCredential
-		}
-		webrtcConfig.ICEServers = append(webrtcConfig.ICEServers, iceServer)
-	}
-
-	// Add multiple STUN servers for redundancy (if only one configured)
-	if len(webrtcConfig.ICEServers) <= 1 {
-		log.Println("Adding additional STUN servers for better connectivity...")
-		additionalSTUN := []string{
-			"stun:stun1.l.google.com:19302",
-			"stun:stun2.l.google.com:19302",
-			"stun:stun3.l.google.com:19302",
-		}
-		for _, stunURL := range additionalSTUN {
-			webrtcConfig.ICEServers = append(webrtcConfig.ICEServers, webrtc.ICEServer{
-				URLs: []string{stunURL},
-			})
-		}
-	}
-
-	log.Printf("✅ Configured %d ICE server(s) for connectivity", len(webrtcConfig.ICEServers))
+	// Get centralized WebRTC configuration (ICE/STUN/TURN)
+	webrtcConfig := iceutils.GetWebRTCConfiguration()
 
 	// Create peer connection with proper codec support
 	mediaEngine := &webrtc.MediaEngine{}
