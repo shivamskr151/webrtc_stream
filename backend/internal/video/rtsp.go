@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 // detectBestEncoder detects and returns the best available H.264 encoder
 // Returns encoder name and encoder-specific parameters
+// Also checks if hardware devices are actually accessible
 func detectBestEncoder() (string, []string) {
 	// Check if ffmpeg is available
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
@@ -37,10 +39,12 @@ func detectBestEncoder() (string, []string) {
 		log.Println("⚠️ h264_videotoolbox not available, falling back to software")
 
 	case "linux":
-		// Try VAAPI (Intel/AMD integrated graphics)
-		if hasEncoder("h264_vaapi") {
-			log.Println("✅ Found h264_vaapi (Intel/AMD hardware encoder)")
+		// Try VAAPI (Intel/AMD integrated graphics) - but check if device exists first
+		if hasEncoder("h264_vaapi") && hasVAAPIDevice() {
+			log.Println("✅ Found h264_vaapi (Intel/AMD hardware encoder) with accessible device")
 			return "h264_vaapi", getVAAPIParams()
+		} else if hasEncoder("h264_vaapi") {
+			log.Println("⚠️ h264_vaapi found but device not accessible, falling back to software")
 		}
 		// Try NVENC (NVIDIA GPU)
 		if hasEncoder("h264_nvenc") {
@@ -70,6 +74,39 @@ func detectBestEncoder() (string, []string) {
 
 	// Fallback to software encoder
 	return "libx264", getSoftwareEncoderParams()
+}
+
+// hasVAAPIDevice checks if VAAPI device is accessible and functional
+func hasVAAPIDevice() bool {
+	// Check if /dev/dri/renderD128 exists (default VAAPI device)
+	// Also check for other common render devices
+	devices := []string{"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130"}
+	hasDevice := false
+	for _, device := range devices {
+		if _, err := os.Stat(device); err == nil {
+			hasDevice = true
+			break
+		}
+	}
+	
+	if !hasDevice {
+		return false
+	}
+	
+	// Test if VAAPI actually works by running a simple FFmpeg command
+	// This catches cases where device exists but VAAPI driver isn't functional
+	testCmd := exec.Command("ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "testsrc=duration=0.1:size=320x240:rate=1",
+		"-c:v", "h264_vaapi", "-vaapi_device", "/dev/dri/renderD128",
+		"-frames:v", "1", "-f", "null", "-")
+	testCmd.Stdout = nil
+	testCmd.Stderr = nil
+	if err := testCmd.Run(); err != nil {
+		// VAAPI test failed - device exists but not functional
+		log.Printf("⚠️ VAAPI device exists but test encoding failed - will use software encoding")
+		return false
+	}
+	
+	return true
 }
 
 // hasEncoder checks if FFmpeg has a specific encoder available
@@ -279,16 +316,27 @@ func (r *RTSPVideoSource) Start() error {
 					log.Printf("ffmpeg: %s", line)
 				}
 
-				// Detect critical errors early (404, connection refused, etc.)
+				// Detect critical errors early (404, connection refused, hardware encoder failures, etc.)
 				// (lowerLine already defined above)
+				isHardwareEncoderError := strings.Contains(lowerLine, "vaapi") && (strings.Contains(lowerLine, "failed") ||
+					strings.Contains(lowerLine, "error") ||
+					strings.Contains(lowerLine, "device creation failed") ||
+					strings.Contains(lowerLine, "failed to initialise") ||
+					strings.Contains(lowerLine, "input/output error"))
+				
 				if strings.Contains(lowerLine, "404 not found") ||
 					strings.Contains(lowerLine, "connection refused") ||
 					strings.Contains(lowerLine, "failed") ||
-					strings.Contains(lowerLine, "error opening input") {
+					strings.Contains(lowerLine, "error opening input") ||
+					isHardwareEncoderError {
 					ffmpegErrorMutex.Lock()
 					if ffmpegError == nil {
 						ffmpegError = fmt.Errorf("FFmpeg critical error: %s", line)
 						log.Printf("❌ FFmpeg error detected: %s", line)
+						if isHardwareEncoderError {
+							log.Printf("⚠️ Hardware encoder (VAAPI) failed - this may indicate hardware acceleration is not available")
+							log.Printf("   Consider using software encoding (libx264) if this persists")
+						}
 					}
 					ffmpegErrorMutex.Unlock()
 				}
