@@ -764,11 +764,19 @@ func (p *Publisher) StartStreaming() error {
 			// - "FFmpeg stdout closed"
 			// - "FFmpeg may have failed or exited" (from channel closed errors)
 			// - "channel closed" (when it indicates FFmpeg failure)
+			// - "FFmpeg restart failed" (after max attempts)
 			// BUT NOT: "no frame available" which is just a temporary condition
-			if strings.Contains(errStr, "FFmpeg process exited") ||
+			// BUT NOT: "temporarily unavailable" which is a temporary condition
+			// BUT NOT: "restarting" or "appears stuck" which triggers automatic restart
+			if strings.Contains(errStr, "restarting") || strings.Contains(errStr, "appears stuck") {
+				// FFmpeg is restarting - this is expected and will recover
+				log.Printf("⏳ FFmpeg is restarting, waiting for recovery...")
+				isFatalError = false // Don't treat restart as fatal
+			} else if strings.Contains(errStr, "FFmpeg process exited") ||
 				strings.Contains(errStr, "FFmpeg critical error") ||
 				strings.Contains(errStr, "FFmpeg stdout closed") ||
 				strings.Contains(errStr, "FFmpeg may have failed") ||
+				strings.Contains(errStr, "FFmpeg restart failed") ||
 				(strings.Contains(errStr, "channel closed") &&
 					!strings.Contains(errStr, "no frame available")) {
 				isFatalError = true
@@ -811,6 +819,19 @@ func (p *Publisher) StartStreaming() error {
 			if isFatalError {
 				// Always log fatal errors immediately
 				log.Printf("❌ Error capturing frame (count: %d): %v", errorCount, err)
+				// For fatal errors after streaming has started, wait a bit to see if FFmpeg restarts
+				if frameCount > 0 {
+					log.Printf("   FFmpeg may restart automatically - will continue attempting frames...")
+					// Reset error count after a delay to give restart time
+					if errorCount%100 == 0 {
+						log.Printf("   Still waiting for FFmpeg recovery after %d errors...", errorCount)
+					}
+				}
+			} else if strings.Contains(errStr, "restarting") {
+				// FFmpeg is restarting - just wait
+				if errorCount%30 == 0 {
+					log.Printf("⏳ Waiting for FFmpeg to restart (attempt %d)...", errorCount)
+				}
 			} else if frameCount == 0 {
 				// During initialization, log temporary errors periodically
 				if errorCount%30 == 0 {
@@ -820,16 +841,17 @@ func (p *Publisher) StartStreaming() error {
 			} else {
 				// After we've successfully streamed frames, suppress "no frame available" errors
 				// as they're just temporary gaps between frames
-				if !strings.Contains(errStr, "no frame available") {
+				if !strings.Contains(errStr, "no frame available") && !strings.Contains(errStr, "temporarily unavailable") {
 					// Log other temporary errors periodically
 					if errorCount%60 == 0 {
 						log.Printf("⚠️ Temporary error capturing frame (count: %d): %v", errorCount, err)
 						log.Printf("   Continuing stream - will retry next frame...")
 					}
 				}
-				// Completely suppress "no frame available" errors when already streaming
+				// Completely suppress "no frame available" and "temporarily unavailable" errors when already streaming
 			}
 			// Don't skip ticker - continue immediately to keep frame rate consistent
+			// The stream will recover automatically when FFmpeg restarts or frames become available
 			continue
 		}
 

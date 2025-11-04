@@ -202,18 +202,23 @@ type RTSPVideoSource struct {
 	spsPpsFound  bool   // Track if we've received SPS/PPS
 	currentFrame []byte // Accumulator for all NAL units in current access unit
 	frameRate    int    // Detected frame rate from stream (FPS)
+	restartMu       sync.Mutex // Mutex for restart operations
+	restartCount    int        // Track restart attempts
+	lastFrameTime   time.Time  // Track when last frame was received
+	restartInProgress bool    // Flag to prevent concurrent restarts
 }
 
 func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
 	return &RTSPVideoSource{
-		rtspURL:      rtspURL,
-		frameChan:    make(chan []byte, 5), // Buffer 5 frames to prevent drops during network jitter
-		errChan:      make(chan error, 1),
-		accessUnit:   make([]byte, 0, 128*1024), // Further reduced for minimal latency
-		spsPps:       make([]byte, 0, 1024),
-		spsPpsFound:  false,
-		currentFrame: make([]byte, 0, 64*1024),   // Minimal frame buffer
-		frameRate:    config.AppConfig.Video.FPS, // Default to config, will be updated from stream
+		rtspURL:       rtspURL,
+		frameChan:     make(chan []byte, 5), // Buffer 5 frames to prevent drops during network jitter
+		errChan:       make(chan error, 1),
+		accessUnit:    make([]byte, 0, 128*1024), // Further reduced for minimal latency
+		spsPps:        make([]byte, 0, 1024),
+		spsPpsFound:   false,
+		currentFrame:  make([]byte, 0, 64*1024),   // Minimal frame buffer
+		frameRate:     config.AppConfig.Video.FPS, // Default to config, will be updated from stream
+		lastFrameTime: time.Now(),
 	}, nil
 }
 
@@ -393,28 +398,28 @@ func (r *RTSPVideoSource) Start() error {
 			}
 		}
 
-		// Send error to errChan so ReadFrame can detect it
-		// Use recover to prevent panic if channel is already closed
-		if storedError != nil {
+		// Check if source is closed before attempting restart
+		r.mu.Lock()
+		isClosed := r.closed
+		r.mu.Unlock()
+
+		if !isClosed {
+			// Attempt automatic restart if not closed
+			log.Printf("🔄 FFmpeg process exited, attempting automatic restart...")
+			go r.restartFFmpeg()
+		} else {
+			// Source is closed, just send error and exit
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						// Channel was closed - this is expected if readFrames exited first
-						log.Printf("⚠️ Could not send FFmpeg error to channel (already closed): %v", storedError)
+						// Channel was closed - this is expected
 					}
 				}()
 
-				// Check if source is closed before attempting to send
-				r.mu.Lock()
-				isClosed := r.closed
-				r.mu.Unlock()
-
-				if !isClosed {
+				if storedError != nil {
 					select {
 					case r.errChan <- storedError:
-						// Successfully sent error
 					default:
-						// Channel might be full or closed (non-blocking)
 					}
 				}
 			}()
@@ -432,9 +437,136 @@ func (r *RTSPVideoSource) Start() error {
 	return nil
 }
 
+// restartFFmpeg attempts to restart the FFmpeg process
+func (r *RTSPVideoSource) restartFFmpeg() {
+	r.restartMu.Lock()
+	
+	// Check if restart is already in progress
+	if r.restartInProgress {
+		r.restartMu.Unlock()
+		log.Printf("⚠️ Restart already in progress, skipping duplicate restart request")
+		return
+	}
+	
+	r.restartInProgress = true
+	r.restartMu.Unlock()
+	
+	defer func() {
+		r.restartMu.Lock()
+		r.restartInProgress = false
+		r.restartMu.Unlock()
+	}()
+
+	// Check if already closed
+	r.mu.Lock()
+	isClosed := r.closed
+	r.mu.Unlock()
+
+	if isClosed {
+		return
+	}
+
+	// Limit restart attempts to prevent infinite loops
+	r.restartCount++
+	maxRestarts := 10
+	if r.restartCount > maxRestarts {
+		log.Printf("❌ Max restart attempts (%d) exceeded, stopping automatic restart", maxRestarts)
+		// Send final error
+		defer func() {
+			if r := recover(); r != nil {
+			}
+		}()
+		select {
+		case r.errChan <- fmt.Errorf("FFmpeg restart failed after %d attempts", maxRestarts):
+		default:
+		}
+		return
+	}
+
+	log.Printf("🔄 Restarting FFmpeg (attempt %d/%d)...", r.restartCount, maxRestarts)
+
+	// Wait a bit before restarting to avoid rapid restart loops
+	time.Sleep(time.Duration(r.restartCount) * time.Second)
+
+	// Clean up old process if still exists
+	r.mu.Lock()
+	if r.cmd != nil && r.cmd.Process != nil {
+		r.cmd.Process.Kill()
+		r.cmd.Wait()
+	}
+	if r.stdout != nil {
+		r.stdout.Close()
+	}
+	r.mu.Unlock()
+
+	// Recreate channels if needed (readFrames only closes them if source is closed, but be safe)
+	r.mu.Lock()
+	// Always recreate channels to ensure clean state after restart
+	// Close old channels if they exist (they might be closed already, ignore errors)
+	if r.frameChan != nil {
+		// Try to drain any remaining frames
+		for {
+			select {
+			case <-r.frameChan:
+			default:
+				goto frameChanDone
+			}
+		}
+	frameChanDone:
+		// Channel will be recreated below
+	}
+	r.frameChan = make(chan []byte, 5)
+	
+	if r.errChan != nil {
+		// Try to drain any remaining errors
+		for {
+			select {
+			case <-r.errChan:
+			default:
+				goto errChanDone
+			}
+		}
+	errChanDone:
+		// Channel will be recreated below
+	}
+	r.errChan = make(chan error, 1)
+	
+	// Reset frame accumulation
+	r.currentFrame = r.currentFrame[:0]
+	r.accessUnit = r.accessUnit[:0]
+	r.spsPpsFound = false
+	r.mu.Unlock()
+
+	// Restart FFmpeg
+	if err := r.Start(); err != nil {
+		log.Printf("❌ Failed to restart FFmpeg: %v", err)
+		// Retry after delay
+		go func() {
+			time.Sleep(5 * time.Second)
+			r.restartFFmpeg()
+		}()
+	} else {
+		log.Printf("✅ FFmpeg restarted successfully")
+		r.restartCount = 0 // Reset counter on successful restart
+		// Reset lastFrameTime to give restart time to produce frames
+		r.mu.Lock()
+		r.lastFrameTime = time.Now()
+		r.mu.Unlock()
+	}
+}
+
 func (r *RTSPVideoSource) readFrames() {
-	defer close(r.frameChan)
-	defer close(r.errChan)
+	defer func() {
+		// Only close channels if source is actually closed
+		r.mu.Lock()
+		isClosed := r.closed
+		r.mu.Unlock()
+
+		if isClosed {
+			close(r.frameChan)
+			close(r.errChan)
+		}
+	}()
 
 	// H264 NAL Unit start codes: 0x00000001 or 0x000001
 	buffer := make([]byte, 0, 128*1024)              // 128KB initial buffer (minimal for zero-latency)
@@ -726,6 +858,11 @@ func (r *RTSPVideoSource) readFrames() {
 							frameQueueCounter++
 							// Send frame with buffering to handle network jitter
 							// Buffer allows smooth playback during temporary network delays
+							// Update last frame time
+							r.mu.Lock()
+							r.lastFrameTime = time.Now()
+							r.mu.Unlock()
+
 							select {
 							case r.frameChan <- frameToSend:
 								// Frame sent successfully
@@ -1037,10 +1174,51 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("RTSP source is closed")
 	}
 
+	// Process health is monitored by the Wait() goroutine which will trigger restart
+	// No need to check here - rely on frame timeout health check below
+
+	// Check if we've been waiting too long for frames (health check)
+	r.mu.Lock()
+	lastFrameTime := r.lastFrameTime
+	timeSinceLastFrame := time.Since(lastFrameTime)
+	cmd := r.cmd
+	r.mu.Unlock()
+
+	// If we've been streaming and haven't received a frame in 30 seconds, FFmpeg is likely stuck
+	// Proactively restart FFmpeg even if process hasn't exited
+	if timeSinceLastFrame > 30*time.Second && !lastFrameTime.IsZero() {
+		// Check if restart is already in progress
+		r.restartMu.Lock()
+		alreadyRestarting := r.restartInProgress
+		r.restartMu.Unlock()
+		
+		if !alreadyRestarting {
+			log.Printf("⚠️ No frames received for %.1f seconds, FFmpeg may be stuck - forcing restart...", timeSinceLastFrame.Seconds())
+			// Force restart FFmpeg - it's likely hung or stuck
+			if cmd != nil && cmd.Process != nil {
+				log.Printf("🔄 Killing stuck FFmpeg process and restarting...")
+				// Kill the process to force restart
+				cmd.Process.Kill()
+				// Give it a moment to exit
+				time.Sleep(1 * time.Second)
+			}
+			// Trigger restart
+			go r.restartFFmpeg()
+		}
+		// Return error so caller knows to retry after restart
+		return nil, fmt.Errorf("FFmpeg appears stuck, restarting...")
+	} else if timeSinceLastFrame > 10*time.Second && !lastFrameTime.IsZero() {
+		// Warning threshold - log but don't restart yet
+		// Only log once per 10 seconds to avoid spam
+		if int(timeSinceLastFrame.Seconds())%10 == 0 {
+			log.Printf("⚠️ No frames received for %.1f seconds, monitoring FFmpeg...", timeSinceLastFrame.Seconds())
+		}
+	}
+
 	// Real-time streaming: Try to get frame with reasonable timeout
 	// Increased timeout to prevent frame drops during network jitter
-	// Frame rate is 15fps (66ms per frame), so 200ms timeout allows for some buffering
-	timeout := time.After(200 * time.Millisecond)
+	// Frame rate is 15fps (66ms per frame), so 500ms timeout allows for network delays
+	timeout := time.After(500 * time.Millisecond)
 
 	select {
 	case frame, ok := <-r.frameChan:
@@ -1110,8 +1288,46 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 				// err is nil but channel is open - this shouldn't happen, but handle it
 				return nil, fmt.Errorf("unexpected nil error from error channel")
 			default:
-				// Still no frame - return error instead of infinite recursion
-				return nil, fmt.Errorf("no frame available - FFmpeg may still be initializing or stream may be unavailable")
+				// Still no frame - check if channels are closed (indicates FFmpeg died)
+				// If channels are still open, this is just a temporary delay
+				r.mu.Lock()
+				isClosed := r.closed
+				r.mu.Unlock()
+
+				if isClosed {
+					return nil, fmt.Errorf("RTSP source is closed")
+				}
+
+				// Check if we've been waiting too long - if so, trigger restart
+				r.mu.Lock()
+				lastFrameTime := r.lastFrameTime
+				timeSinceLastFrame := time.Since(lastFrameTime)
+				cmd := r.cmd
+				r.mu.Unlock()
+
+				// If no frames for 30+ seconds, force restart
+				if timeSinceLastFrame > 30*time.Second && !lastFrameTime.IsZero() {
+					// Check if restart is already in progress
+					r.mu.Lock()
+					r.mu.Unlock() // Need to check restart flag
+					r.restartMu.Lock()
+					alreadyRestarting := r.restartInProgress
+					r.restartMu.Unlock()
+					
+					if !alreadyRestarting {
+						log.Printf("⚠️ No frames available for %.1f seconds, forcing FFmpeg restart...", timeSinceLastFrame.Seconds())
+						if cmd != nil && cmd.Process != nil {
+							cmd.Process.Kill()
+							time.Sleep(1 * time.Second)
+						}
+						go r.restartFFmpeg()
+					}
+					return nil, fmt.Errorf("FFmpeg appears stuck, restarting...")
+				}
+
+				// Temporary delay - return error but don't stop streaming
+				// The caller should continue and retry
+				return nil, fmt.Errorf("no frame available - FFmpeg may still be initializing or stream may be temporarily unavailable")
 			}
 		}
 	}
@@ -1120,6 +1336,13 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 // processFrame handles frame processing logic separately for reusability
 func (r *RTSPVideoSource) processFrame(frame []byte) ([]byte, error) {
 	frameReadCount++
+	
+	// Update last frame time on successful frame receipt
+	r.mu.Lock()
+	r.lastFrameTime = time.Now()
+	r.restartCount = 0 // Reset restart count on successful frame
+	r.mu.Unlock()
+
 	if frame == nil {
 		return nil, fmt.Errorf("frame channel closed")
 	}
@@ -1246,6 +1469,10 @@ func (r *RTSPVideoSource) Close() error {
 
 	r.closed = true
 
+	// Stop restart attempts
+	r.restartMu.Lock()
+	defer r.restartMu.Unlock()
+
 	if r.cmd != nil && r.cmd.Process != nil {
 		r.cmd.Process.Kill()
 		r.cmd.Wait()
@@ -1253,6 +1480,16 @@ func (r *RTSPVideoSource) Close() error {
 
 	if r.stdout != nil {
 		r.stdout.Close()
+	}
+
+	// Close channels
+	if r.frameChan != nil {
+		close(r.frameChan)
+		r.frameChan = nil
+	}
+	if r.errChan != nil {
+		close(r.errChan)
+		r.errChan = nil
 	}
 
 	return nil
