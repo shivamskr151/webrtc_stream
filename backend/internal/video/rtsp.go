@@ -143,6 +143,9 @@ func getNVENCParams() []string {
 		"-gpu", "0", // Use first GPU
 		"-delay", "0", // No delay
 		"-no-scenecut", "1", // Disable scene cut detection (low latency)
+		"-rc-lookahead", "0", // Disable lookahead for minimal buffering
+		"-surfaces", "1", // Minimal surface count for lowest latency
+		"-cbr", "0", // Disable constant bitrate mode
 	}
 }
 
@@ -204,7 +207,7 @@ type RTSPVideoSource struct {
 func NewRTSPVideoSource(rtspURL string) (*RTSPVideoSource, error) {
 	return &RTSPVideoSource{
 		rtspURL:      rtspURL,
-		frameChan:    make(chan []byte, 1), // Single frame buffer for zero-latency real-time streaming
+		frameChan:    make(chan []byte, 5), // Buffer 5 frames to prevent drops during network jitter
 		errChan:      make(chan error, 1),
 		accessUnit:   make([]byte, 0, 128*1024), // Further reduced for minimal latency
 		spsPps:       make([]byte, 0, 1024),
@@ -250,7 +253,7 @@ func (r *RTSPVideoSource) Start() error {
 		"-color_primaries", "bt709", // BT.709 color primaries
 		"-color_trc", "bt709", // BT.709 transfer characteristics
 		"-bf", "0", // No B-frames (WebRTC requirement for low latency)
-		"-g", "10", // GOP size (keyframe every 10 frames, ~0.33 second at 30fps) - optimized for faster recovery
+		"-g", "15", // GOP size (keyframe every 15 frames, ~1 second at 15fps) - matches actual frame rate for better buffering
 		"-bsf:v", "h264_mp4toannexb", // Convert to Annex-B format (required for raw H264)
 		"-f", "h264", // Raw H264 format
 		"-flush_packets", "1", // Flush packets immediately
@@ -721,8 +724,8 @@ func (r *RTSPVideoSource) readFrames() {
 							}
 
 							frameQueueCounter++
-							// Zero-latency real-time: Always keep only the latest frame
-							// Drop any old frame immediately and replace with newest
+							// Send frame with buffering to handle network jitter
+							// Buffer allows smooth playback during temporary network delays
 							select {
 							case r.frameChan <- frameToSend:
 								// Frame sent successfully
@@ -730,8 +733,8 @@ func (r *RTSPVideoSource) readFrames() {
 									log.Printf("📤 Queued complete access unit #%d: %d bytes", frameQueueCounter, len(frameToSend))
 								}
 							default:
-								// Channel is full - immediately replace with newest frame (drop old one)
-								// This ensures perfectly real-time streaming with zero buffering delays
+								// Channel is full - drop oldest frame to prevent excessive buffering
+								// This prevents buffer buildup while maintaining smooth playback
 								select {
 								case oldFrame := <-r.frameChan: // Remove and discard old frame
 									_ = oldFrame // Explicitly discard old frame
@@ -739,11 +742,11 @@ func (r *RTSPVideoSource) readFrames() {
 									case r.frameChan <- frameToSend: // Add newest frame
 										// Successfully replaced old frame with new one
 										if frameQueueCounter%100 == 0 {
-											log.Printf("⚡ Real-time: Replaced old frame #%d with latest - zero buffering", frameQueueCounter)
+											log.Printf("⚡ Buffer full: Replaced old frame #%d with latest", frameQueueCounter)
 										}
 									default:
 										// Extremely rare - channel filled between operations
-										// Log but continue (shouldn't happen with size 1)
+										log.Printf("⚠️ Warning: Frame channel still full after drop")
 									}
 								default:
 									// Channel became empty between checks - send new frame
@@ -1034,9 +1037,10 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("RTSP source is closed")
 	}
 
-	// Zero-latency real-time: Try to get frame immediately, very short timeout
-	// If no frame available, wait briefly but don't block long
-	timeout := time.After(100 * time.Millisecond) // Ultra-short timeout for real-time
+	// Real-time streaming: Try to get frame with reasonable timeout
+	// Increased timeout to prevent frame drops during network jitter
+	// Frame rate is 15fps (66ms per frame), so 200ms timeout allows for some buffering
+	timeout := time.After(200 * time.Millisecond)
 
 	select {
 	case frame, ok := <-r.frameChan:
@@ -1089,7 +1093,7 @@ func (r *RTSPVideoSource) ReadFrame() ([]byte, error) {
 
 			// No frame available yet - retry once more with a brief sleep to avoid busy-waiting
 			// but don't recurse infinitely
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(33 * time.Millisecond) // ~1 frame at 30fps, prevents excessive retries
 			select {
 			case frame, ok := <-r.frameChan:
 				if !ok {

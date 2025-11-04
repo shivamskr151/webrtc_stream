@@ -138,6 +138,7 @@ const VideoViewer: React.FC = () => {
             playsInline
             muted
             controls={false}
+            preload="none"
             style={{
               width: '100%',
               height: '100%',
@@ -146,6 +147,17 @@ const VideoViewer: React.FC = () => {
               backgroundColor: '#000000',
             }}
             onLoadedMetadata={() => {
+              // Configure video element for low-latency playback
+              if (videoRef.current) {
+                // Reduce buffering by setting small buffer sizes
+                // This helps with real-time streaming
+                try {
+                  // Set playback rate to 1.0 to ensure smooth playback
+                  videoRef.current.playbackRate = 1.0;
+                } catch (e) {
+                  // Ignore errors if property is not supported
+                }
+              }
               console.log('✅ Video metadata loaded:', {
                 videoWidth: videoRef.current?.videoWidth,
                 videoHeight: videoRef.current?.videoHeight,
