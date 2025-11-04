@@ -1,8 +1,29 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useWebRTC } from '../hooks/useWebRTC';
+import { captureVideoFrame, revokeSnapshot } from '../utils/snapshot';
+import type { SnapshotResult } from '../utils/snapshot';
+import SnapshotPanel from './SnapshotPanel';
 
 const VideoViewer: React.FC = () => {
   const { isConnected, connectionState, hasTrack, videoRef, connect, disconnect } = useWebRTC();
+  const [lastSnapshot, setLastSnapshot] = useState<SnapshotResult | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (lastSnapshot) revokeSnapshot(lastSnapshot);
+    };
+  }, [lastSnapshot]);
+
+  const onCapture = async () => {
+    if (!videoRef.current) return;
+    try {
+      const shot = await captureVideoFrame(videoRef.current);
+      if (lastSnapshot) revokeSnapshot(lastSnapshot);
+      setLastSnapshot(shot);
+    } catch (e) {
+      console.error('Failed to capture snapshot', e);
+    }
+  };
 
   const getConnectionStatusColor = () => {
     switch (connectionState) {
@@ -117,6 +138,32 @@ const VideoViewer: React.FC = () => {
               }}
             >
               {isConnected ? 'Disconnect' : 'Connect'}
+            </button>
+
+            {/* Capture Snapshot Button */}
+            <button
+              onClick={onCapture}
+              disabled={!hasTrack}
+              style={{
+                padding: '10px 20px',
+                backgroundColor: hasTrack ? '#059669' : '#065f46',
+                color: '#ffffff',
+                borderRadius: '8px',
+                border: 'none',
+                cursor: hasTrack ? 'pointer' : 'not-allowed',
+                fontWeight: '600',
+                fontSize: '14px',
+                whiteSpace: 'nowrap',
+                transition: 'background-color 0.2s'
+              }}
+              onMouseEnter={(e) => {
+                if (hasTrack) e.currentTarget.style.backgroundColor = '#047857';
+              }}
+              onMouseLeave={(e) => {
+                if (hasTrack) e.currentTarget.style.backgroundColor = '#059669';
+              }}
+            >
+              Capture Snapshot
             </button>
           </div>
         </div>
@@ -294,6 +341,15 @@ const VideoViewer: React.FC = () => {
             </div>
           </div>
         </div>
+
+        <SnapshotPanel
+          snapshot={lastSnapshot}
+          onClear={() => {
+            const prev = lastSnapshot;
+            setLastSnapshot(null);
+            if (prev) revokeSnapshot(prev);
+          }}
+        />
       </div>
     </div>
   );
