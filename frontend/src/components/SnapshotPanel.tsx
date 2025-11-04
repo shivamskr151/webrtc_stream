@@ -11,50 +11,53 @@ const SnapshotPanel: React.FC<SnapshotPanelProps> = ({ snapshot, onClear }) => {
     return null;
   }
 
-  const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleTimeString();
-  };
 
   return (
     <div style={{
-      backgroundColor: '#374151',
-      padding: '20px 24px',
-      borderTop: '1px solid #4b5563'
+      backgroundColor: '#ffffff',
+      padding: '28px 32px',
+      borderTop: '2px solid #e5e7eb'
     }}>
       <div style={{
         display: 'flex',
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'space-between',
-        gap: '16px',
-        marginBottom: '16px'
+        gap: '20px',
+        marginBottom: '24px'
       }}>
         <h2 style={{
-          fontSize: '18px',
-          fontWeight: '600',
-          color: '#ffffff',
-          margin: 0
+          fontSize: '22px',
+          fontWeight: '700',
+          color: '#111827',
+          margin: 0,
+          letterSpacing: '-0.3px'
         }}>
           Captured Snapshot
         </h2>
         <button
           onClick={onClear}
           style={{
-            padding: '8px 16px',
+            padding: '10px 20px',
             backgroundColor: '#dc2626',
             color: '#ffffff',
-            borderRadius: '6px',
+            borderRadius: '8px',
             border: 'none',
             cursor: 'pointer',
-            fontWeight: '500',
+            fontWeight: '600',
             fontSize: '14px',
-            transition: 'background-color 0.2s'
+            transition: 'all 0.2s ease',
+            boxShadow: '0 2px 8px rgba(220, 38, 38, 0.25)'
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.backgroundColor = '#b91c1c';
+            e.currentTarget.style.transform = 'translateY(-1px)';
+            e.currentTarget.style.boxShadow = '0 4px 12px rgba(220, 38, 38, 0.35)';
           }}
           onMouseLeave={(e) => {
             e.currentTarget.style.backgroundColor = '#dc2626';
+            e.currentTarget.style.transform = 'translateY(0)';
+            e.currentTarget.style.boxShadow = '0 2px 8px rgba(220, 38, 38, 0.25)';
           }}
         >
           Clear
@@ -63,73 +66,28 @@ const SnapshotPanel: React.FC<SnapshotPanelProps> = ({ snapshot, onClear }) => {
       
       <div style={{
         display: 'flex',
-        flexDirection: 'row',
-        gap: '20px',
-        alignItems: 'flex-start'
+        justifyContent: 'center',
+        alignItems: 'center'
       }}>
         <div style={{
           position: 'relative',
-          borderRadius: '8px',
+          borderRadius: '12px',
           overflow: 'hidden',
-          border: '2px solid #4b5563',
+          border: '3px solid #e5e7eb',
           backgroundColor: '#000000',
-          flexShrink: 0
+          boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)'
         }}>
           <img
             src={snapshot.objectUrl}
             alt="Captured snapshot"
             style={{
-              maxWidth: '400px',
-              maxHeight: '300px',
+              maxWidth: '100%',
+              maxHeight: '500px',
               width: 'auto',
               height: 'auto',
               display: 'block'
             }}
           />
-        </div>
-        
-        <div style={{
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '12px',
-          flex: 1,
-          fontSize: '14px'
-        }}>
-          <div style={{
-            display: 'flex',
-            flexDirection: 'row',
-            gap: '8px',
-            alignItems: 'center'
-          }}>
-            <span style={{ color: '#9ca3af' }}>Dimensions:</span>
-            <span style={{ color: '#d1d5db', fontWeight: '500' }}>
-              {snapshot.width} × {snapshot.height}
-            </span>
-          </div>
-          
-          <div style={{
-            display: 'flex',
-            flexDirection: 'row',
-            gap: '8px',
-            alignItems: 'center'
-          }}>
-            <span style={{ color: '#9ca3af' }}>Captured at:</span>
-            <span style={{ color: '#d1d5db', fontWeight: '500' }}>
-              {formatTime(snapshot.takenAt)}
-            </span>
-          </div>
-          
-          <div style={{
-            display: 'flex',
-            flexDirection: 'row',
-            gap: '8px',
-            alignItems: 'center'
-          }}>
-            <span style={{ color: '#9ca3af' }}>Size:</span>
-            <span style={{ color: '#d1d5db', fontWeight: '500' }}>
-              {(snapshot.blob.size / 1024).toFixed(2)} KB
-            </span>
-          </div>
         </div>
       </div>
     </div>
